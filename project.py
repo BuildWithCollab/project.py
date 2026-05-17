@@ -174,13 +174,14 @@ def clang_tidy_check_and_fix(
 
 
 # --- Built-in tasks ---
+# Contract: a task named X reads its config from cfg.tools["X"] (i.e. [X] in project.toml).
 
 def clang_tidy(cfg: Config) -> None:
-    tools = cfg.tools.get("cpp", {})
+    opts = cfg.tools.get("clang_tidy", {})
     clang_tidy_check_and_fix(
-        binary=tools.get("clang_tidy_binary", "clang-tidy"),
-        jobs=tools.get("clang_tidy_jobs"),
-        fix=tools.get("clang_tidy_fix", True),
+        binary=opts.get("binary", "clang-tidy"),
+        jobs=opts.get("jobs"),
+        fix=opts.get("fix", True),
     )
 
 
@@ -193,7 +194,7 @@ def xmake_build(cfg: Config) -> None:
 
 
 def npm_install(cfg: Config) -> None:
-    pm = cfg.tools.get("node", {}).get("package_manager", "npm")
+    pm = cfg.tools.get("npm_install", {}).get("package_manager", "npm")
     run([pm, "install"])
 
 
@@ -260,14 +261,15 @@ name = "{name}"
 #
 # lint  = ["ruff"]
 
-# --- Tool-specific config (each section is read by the corresponding task) ---
+# --- Per-task config ---
+# A task named X reads its config from [X] below.
 #
-# [cpp]
-# clang_tidy_binary = "clang-tidy-21"
-# clang_tidy_jobs = 16
-# clang_tidy_fix = true
+# [clang_tidy]
+# binary = "clang-tidy-21"
+# jobs = 16
+# fix = true
 #
-# [node]
+# [npm_install]
 # package_manager = "pnpm"
 """
 

@@ -42,9 +42,9 @@ setup = ["xmake_config"]
 build = ["xmake_build"]
 lint  = ["clang_tidy"]
 
-[cpp]
-clang_tidy_binary = "clang-tidy-21"
-clang_tidy_jobs = 16
+[clang_tidy]
+binary = "clang-tidy-21"
+jobs = 16
 ```
 
 ```
@@ -71,24 +71,26 @@ The `:` is only needed when referencing something outside `project.py` — it se
 
 ## Built-in tasks
 
-| Task             | Runs                                          | Reads from `project.toml`        |
-| ---------------- | --------------------------------------------- | -------------------------------- |
-| `clang_tidy`     | Two-pass clang-tidy (parallel check, serial `-fix-errors`) | `[cpp]` |
-| `xmake_config`   | `xmake config`                                | —                                |
-| `xmake_build`    | `xmake build`                                 | —                                |
-| `npm_install`    | `<package_manager> install`                   | `[node]`                         |
-| `eslint`         | `npx eslint .`                                | —                                |
-| `ruff`           | `ruff check .`                                | —                                |
+**Config contract:** a task named `X` reads its config from `[X]` in `project.toml`. Want to grep for what feeds a task? The section name is the task name.
 
-### `[cpp]` keys
+| Task             | Runs                                                       | Optional `[X]` keys                                |
+| ---------------- | ---------------------------------------------------------- | -------------------------------------------------- |
+| `clang_tidy`     | Two-pass clang-tidy (parallel check, serial `-fix-errors`) | `binary`, `jobs`, `fix`                            |
+| `xmake_config`   | `xmake config`                                             | —                                                  |
+| `xmake_build`    | `xmake build`                                              | —                                                  |
+| `npm_install`    | `<package_manager> install`                                | `package_manager`                                  |
+| `eslint`         | `npx eslint .`                                             | —                                                  |
+| `ruff`           | `ruff check .`                                             | —                                                  |
 
-| Key                   | Default        | Notes                                              |
-| --------------------- | -------------- | -------------------------------------------------- |
-| `clang_tidy_binary`   | `clang-tidy`   | e.g. `clang-tidy-21` on Ubuntu.                    |
-| `clang_tidy_jobs`     | `os.cpu_count()` | Parallel workers for the check pass.             |
-| `clang_tidy_fix`      | `true`         | Run the serial `-fix-errors` pass after checking.  |
+### `[clang_tidy]` keys
 
-### `[node]` keys
+| Key       | Default          | Notes                                              |
+| --------- | ---------------- | -------------------------------------------------- |
+| `binary`  | `clang-tidy`     | e.g. `clang-tidy-21` on Ubuntu.                    |
+| `jobs`    | `os.cpu_count()` | Parallel workers for the check pass.               |
+| `fix`     | `true`           | Run the serial `-fix-errors` pass after checking.  |
+
+### `[npm_install]` keys
 
 | Key                | Default | Notes                              |
 | ------------------ | ------- | ---------------------------------- |
@@ -116,15 +118,24 @@ lint   = ["clang_tidy", "scripts.repochecks:run"]
 deploy = ["scripts.deploy.staging:go"]
 ```
 
-Each task function takes one argument: the `Config` instance.
+Each task function takes one argument: the `Config` instance. By convention, a custom task reads its own config from `cfg.tools["section-name"]`, where the section name is whatever you put in `project.toml` — typically matching the function name.
 
 ```python
 # scripts/repochecks.py
 from project import Config, run
 
-def run(cfg: Config) -> None:
-    print("repo-specific checks")
-    run(["echo", "hello"])
+def check(cfg: Config) -> None:
+    opts = cfg.tools.get("repochecks", {})
+    timeout = opts.get("timeout", 30)
+    run(["echo", f"checking with timeout={timeout}"])
+```
+
+```toml
+[commands]
+lint = ["clang_tidy", "scripts.repochecks:check"]
+
+[repochecks]
+timeout = 60
 ```
 
 Helpers available to import from `project`:
