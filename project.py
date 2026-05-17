@@ -238,6 +238,48 @@ def call(spec: str, cfg: Config) -> None:
     target(cfg)
 
 
+# --- init ---
+
+_TOML_TEMPLATE = """\
+[project]
+name = "{name}"
+
+[commands]
+# Each command is a list of task references. A task can be:
+#   - a built-in function name              (e.g. "clang_tidy", "xmake_build")
+#   - a module path with attribute via ":"  (e.g. "scripts.deploy.staging:go")
+#
+# Uncomment / adapt for this project:
+#
+# setup = ["xmake_config"]
+# build = ["xmake_build"]
+# lint  = ["clang_tidy"]
+#
+# setup = ["npm_install"]
+# lint  = ["eslint"]
+#
+# lint  = ["ruff"]
+
+# --- Tool-specific config (each section is read by the corresponding task) ---
+#
+# [cpp]
+# clang_tidy_binary = "clang-tidy-21"
+# clang_tidy_jobs = 16
+# clang_tidy_fix = true
+#
+# [node]
+# package_manager = "pnpm"
+"""
+
+
+def init() -> None:
+    if TOML_PATH.exists():
+        print(f"{TOML_PATH.name} already exists.", file=sys.stderr)
+        raise SystemExit(1)
+    TOML_PATH.write_text(_TOML_TEMPLATE.format(name=ROOT.name), encoding="utf-8")
+    print(f"wrote {TOML_PATH}")
+
+
 # --- GitHub helpers + self-update ---
 
 def _github_request(url: str) -> Request:
@@ -284,7 +326,7 @@ def self_update() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="project.py", description="one file to rule the repo")
-    parser.add_argument("command", help="command name (setup, lint, build, self-update, ...)")
+    parser.add_argument("command", help="command name (init, setup, lint, build, self-update, ...)")
     parser.add_argument("args", nargs=argparse.REMAINDER, help="forwarded to tasks via cfg.args")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
@@ -296,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.command == "self-update":
         self_update()
+        return 0
+    if ns.command == "init":
+        init()
         return 0
 
     cfg = Config.load()
