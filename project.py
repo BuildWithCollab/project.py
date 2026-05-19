@@ -36,8 +36,12 @@ __version__ = "0.1.0"
 SELF_UPDATE_REPO = "BuildWithCollab/project.py"
 SELF_UPDATE_PATH = "project.py"
 
+TEMPLATES_REF = "main"
+TEMPLATES_DIR = "templates"
+
 ROOT: Path = Path(__file__).resolve().parent
 TOML_PATH: Path = ROOT / "project.toml"
+SYNC_LOCK_PATH: Path = ROOT / ".project-sync.lock"
 
 
 # --- Platform ---
@@ -307,6 +311,124 @@ def _github_fetch_json(url: str, context: str = "") -> dict | list:
         raise SystemExit(1)
 
 
+def _github_blob_bytes(sha: str) -> bytes:
+    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/blobs/{sha}"
+    data = _github_fetch_json(url, context=f"blob {sha[:8]}")
+    if not isinstance(data, dict) or "content" not in data:
+        print(f"unexpected blob response for {sha}", file=sys.stderr)
+        raise SystemExit(1)
+    return base64.b64decode(data["content"])
+
+
+# --- sync ---
+
+def _read_sync_lock() -> dict[str, str]:
+    if not SYNC_LOCK_PATH.exists():
+        return {}
+    out: dict[str, str] = {}
+    for raw in SYNC_LOCK_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        sha, _, path = line.partition("  ")
+        if sha and path:
+            out[path] = sha
+    return out
+
+
+def _write_sync_lock(file_shas: dict[str, str]) -> None:
+    header = "# .project-sync.lock — written by `project.py sync`. Do not edit.\n"
+    body = "\n".join(f"{sha}  {path}" for path, sha in sorted(file_shas.items()))
+    SYNC_LOCK_PATH.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+
+
+def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str]]:
+    # Returns {target_relpath: (template_name, blob_sha)}, last-template-wins on conflicts.
+    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
+    data = _github_fetch_json(url, context="template tree")
+    if not isinstance(data, dict):
+        print("unexpected tree response", file=sys.stderr)
+        raise SystemExit(1)
+    if data.get("truncated"):
+        print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
+
+    by_template: dict[str, dict[str, str]] = {t: {} for t in templates}
+    # Longest prefix first so nested names like "cpp/foo" claim their subtree
+    # before a broader "cpp" entry can swallow it.
+    template_prefixes = sorted(
+        ((t, f"{TEMPLATES_DIR}/{t}/") for t in templates),
+        key=lambda p: len(p[1]),
+        reverse=True,
+    )
+    for entry in data.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        path = entry.get("path", "")
+        for tname, tprefix in template_prefixes:
+            if path.startswith(tprefix):
+                by_template[tname][path[len(tprefix):]] = entry["sha"]
+                break
+
+    missing = [t for t in templates if not by_template[t]]
+    if missing:
+        print(f"warning: no files found for template(s): {', '.join(missing)}", file=sys.stderr)
+
+    result: dict[str, tuple[str, str]] = {}
+    for tname in templates:
+        for rel, sha in by_template[tname].items():
+            result[rel] = (tname, sha)
+    return result
+
+
+def sync(cfg: Config) -> None:
+    if not os.environ.get("GH_TOKEN"):
+        print(
+            "sync requires GH_TOKEN. Set it to a GitHub PAT "
+            "(read-only public-repo access is enough).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    opts = cfg.tools.get("sync", {})
+    templates = opts.get("templates", [])
+    if not templates:
+        print("no [sync].templates defined in project.toml", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"syncing {len(templates)} template(s): {', '.join(templates)}")
+    new_files = _list_template_files(templates)
+    old_lock = _read_sync_lock()
+    new_lock: dict[str, str] = {}
+
+    written = 0
+    skipped = 0
+    for path, (tname, sha) in sorted(new_files.items()):
+        new_lock[path] = sha
+        target = ROOT / path
+        if old_lock.get(path) == sha and target.exists():
+            skipped += 1
+            continue
+        content = _github_blob_bytes(sha)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        print(f"  wrote {path}  ({tname})")
+        written += 1
+
+    deleted = 0
+    for path in sorted(set(old_lock) - set(new_lock)):
+        target = ROOT / path
+        if target.exists():
+            try:
+                target.unlink()
+                print(f"  deleted {path}")
+                deleted += 1
+            except OSError as e:
+                print(f"  could not delete {path}: {e}", file=sys.stderr)
+
+    _write_sync_lock(new_lock)
+    print(f"sync done: {written} written, {skipped} unchanged, {deleted} deleted")
+
+
 def self_update() -> None:
     url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{SELF_UPDATE_PATH}?ref=main"
     try:
@@ -347,6 +469,10 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = Config.load()
     cfg.args = ns.args
+
+    if ns.command == "sync":
+        sync(cfg)
+        return 0
 
     tasks = resolve_command(ns.command, cfg)
     if not tasks:

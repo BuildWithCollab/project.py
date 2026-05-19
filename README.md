@@ -149,12 +149,39 @@ For anything beyond friendly single-shot subprocess (output parsing, parallelism
 
 ---
 
+## Syncing templates from GitHub
+
+`sync` pulls files from the `templates/<name>/` folders in this repo into your project.
+
+```toml
+[sync]
+templates = ["python-base", "github-actions", "cpp/xmake"]
+```
+
+```bash
+GH_TOKEN=ghp_xxx python project.py sync
+```
+
+What it does:
+
+- Each named template is a folder under `templates/` in `BuildWithCollab/project.py`. Every file in that folder gets copied into your repo at the same relative path. So `templates/python-base/.gitignore` lands at `./.gitignore`; `templates/github-actions/.github/workflows/ci.yml` lands at `./.github/workflows/ci.yml`.
+- Template names can be nested: `"cpp/xmake"` pulls everything under `templates/cpp/xmake/`. Organize templates into subfolders however you like.
+- Templates compose in order. If two templates ship the same file, the later one in the list wins. If you list overlapping prefixes like `["cpp", "cpp/xmake"]`, the most specific one claims its subtree.
+- Only files whose content actually changed get re-downloaded. `sync` lists the whole tree in one API call, compares each blob's git sha to `.project-sync.lock`, and skips anything unchanged.
+- Files that were in the previous sync but are no longer in any listed template get deleted.
+- `.project-sync.lock` is written at the repo root after each sync. **Commit it to git** so deletions propagate across machines and CI.
+
+`sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately.
+
+---
+
 ## Commands
 
 | Command          | What it does                                            |
 | ---------------- | ------------------------------------------------------- |
 | `init`           | Write a starter `project.toml` (refuses to overwrite).  |
 | `self-update`    | Pull latest `project.py` from this repo.                |
+| `sync`           | Pull template files from this repo into your project.   |
 | `<your command>` | Whatever you defined under `[commands]` in your toml.   |
 | `--help`         | argparse help.                                          |
 | `--version`      | Print version.                                          |
