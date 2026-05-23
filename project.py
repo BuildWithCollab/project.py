@@ -289,12 +289,44 @@ name = "{name}"
 """
 
 
-def init() -> None:
+def _fetch_preset(name: str) -> str:
+    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/presets/{name}.toml?ref={TEMPLATES_REF}"
+    data = _github_fetch_json(url, context=f"preset {name!r}")
+    if not isinstance(data, dict) or "content" not in data:
+        print(f"preset {name!r}: unexpected response", file=sys.stderr)
+        raise SystemExit(1)
+    return base64.b64decode(data["content"]).decode("utf-8")
+
+
+def init(preset: str | None = None) -> None:
     if TOML_PATH.exists():
         print(f"{TOML_PATH.name} already exists.", file=sys.stderr)
         raise SystemExit(1)
-    TOML_PATH.write_text(_TOML_TEMPLATE.format(name=ROOT.name), encoding="utf-8")
-    print(f"wrote {TOML_PATH}")
+
+    if preset is None:
+        TOML_PATH.write_text(_TOML_TEMPLATE.format(name=ROOT.name), encoding="utf-8")
+        print(f"wrote {TOML_PATH}")
+        return
+
+    if not os.environ.get("GH_TOKEN"):
+        print(
+            "init <preset> requires GH_TOKEN. Set it to a GitHub PAT "
+            "(read-only public-repo access is enough).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    body = _fetch_preset(preset)
+    if not body.endswith("\n"):
+        body += "\n"
+    header = f'[project]\nname = "{ROOT.name}"\n\n'
+    TOML_PATH.write_text(header + body, encoding="utf-8")
+    print(f"wrote {TOML_PATH} (preset: {preset})")
+
+    cfg = Config.load()
+    if cfg.tools.get("sync", {}).get("templates"):
+        print("running sync...")
+        sync(cfg)
 
 
 # --- GitHub helpers + self-update ---
@@ -650,7 +682,7 @@ def main(argv: list[str] | None = None) -> int:
         self_update()
         return 0
     if ns.command == "init":
-        init()
+        init(ns.args[0] if ns.args else None)
         return 0
 
     cfg = Config.load()

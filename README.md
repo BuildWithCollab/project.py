@@ -243,6 +243,7 @@ Marker format uses `#` as the comment character, which works for `.gitignore`, `
 | Command          | What it does                                            |
 | ---------------- | ------------------------------------------------------- |
 | `init`           | Write a starter `project.toml` (refuses to overwrite).  |
+| `init <preset>`  | Write a `project.toml` pre-configured from a preset in this repo, then auto-run `sync`. |
 | `self-update`    | Pull latest `project.py` from this repo.                |
 | `sync`           | Pull template files from this repo into your project.   |
 | `<your command>` | Whatever you defined under `[commands]` in your toml.   |
@@ -254,3 +255,63 @@ Extra args after the command get forwarded to tasks as `cfg.args`:
 ```bash
 python project.py lint --fix         # cfg.args == ["--fix"]
 ```
+
+---
+
+## Presets — bootstrap a new repo in one command
+
+`init <preset>` fetches a pre-configured starter from `presets/<name>.toml` in this repo, writes it to your `project.toml`, and then auto-runs `sync` so your template files land immediately.
+
+```bash
+GH_TOKEN=ghp_xxx python project.py init cpp
+```
+
+After that one command, the consumer's repo has:
+
+- A `project.toml` with `[commands]`, `[sync]`, and any per-task config sections already filled in.
+- All template files from `[sync].templates` already synced in (including any `_write_once_/` scaffolds).
+- A `.project-sync.lock` ready to commit.
+
+### Writing a preset
+
+A preset file lives at `presets/<name>.toml` in this repo. It contains **everything except the `[project]` section** — `init` prepends `[project]` itself using the consumer's repo folder name, so the preset stays drift-free.
+
+```toml
+# presets/cpp.toml
+[commands]
+setup = ["xmake_config"]
+build = ["xmake_build"]
+lint  = ["clang_tidy"]
+
+[sync]
+templates = ["cpp/xmake", "git"]
+
+[clang_tidy]
+binary = "clang-tidy-21"
+```
+
+After `python project.py init cpp` in a folder called `my-game/`, the resulting `project.toml` is:
+
+```toml
+[project]
+name = "my-game"
+
+[commands]
+setup = ["xmake_config"]
+build = ["xmake_build"]
+lint  = ["clang_tidy"]
+
+[sync]
+templates = ["cpp/xmake", "git"]
+
+[clang_tidy]
+binary = "clang-tidy-21"
+```
+
+…and sync runs automatically.
+
+Rules:
+
+- **Don't include `[project]` in a preset** — `init` writes that section itself.
+- **Don't put `sync` inside `[commands]`** — sync is its own top-level command, and `init` auto-runs it once for you. Commands like `setup`/`build` are expected to run against the files sync already put in place.
+- `init <preset>` requires `GH_TOKEN` (it makes a GitHub API call). Plain `init` does not.
