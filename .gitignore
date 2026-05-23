@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Artifacts from running project.py against itself for testing.
+# This repo hosts the runner; it does not consume it.
+project.toml
+.project-sync.lock
