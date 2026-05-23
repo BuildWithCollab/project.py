@@ -72,11 +72,13 @@ The `:` is only needed when referencing something outside `project.py` — it se
 
 Suffix a command name with `:windows`, `:macos`, or `:linux` to override its tasks on that platform. The platform-specific entry wins if it exists; otherwise sync falls back to the plain name.
 
+**TOML gotcha:** bare keys in TOML can't contain `:` — quote the key as a string.
+
 ```toml
 [commands]
-lint         = ["clang_tidy"]            # default for any OS not covered below
-lint:macos   = ["scripts.lint:brew_tidy"]
-lint:windows = ["scripts.lint:choco_tidy"]
+lint           = ["clang_tidy"]                  # default for any OS not covered below
+"lint:macos"   = ["scripts.lint:brew_tidy"]
+"lint:windows" = ["scripts.lint:choco_tidy"]
 ```
 
 On macOS, `python project.py lint` runs `scripts.lint:brew_tidy`. On Linux, it falls back to `clang_tidy`. The fallback chain is `<name>:<current-platform>` first, then `<name>`.
@@ -85,8 +87,8 @@ Pairs naturally with shell commands when the OS shell differs:
 
 ```toml
 [commands]
-clean         = ["$rm -rf build/"]
-clean:windows = ["$rmdir /s /q build"]
+clean           = ["$rm -rf build/"]
+"clean:windows" = ["$rmdir /s /q build"]
 ```
 
 ---

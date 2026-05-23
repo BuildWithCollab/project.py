@@ -2,4 +2,4 @@
 templates = ["licenses/0BSD", "git", "cpp/base", "cpp/xmake"]
 
 [commands]
-setup:windows = ["$ xmake f -m release -p windows -a x64 -c -y"]
+"setup:windows" = ["$ xmake f -m release -p windows -a x64 -c -y"]
