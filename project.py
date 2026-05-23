@@ -38,6 +38,7 @@ SELF_UPDATE_PATH = "project.py"
 
 TEMPLATES_REF = "main"
 TEMPLATES_DIR = "templates"
+WRITE_ONCE_DIR = "_write_once_"
 
 ROOT: Path = Path(__file__).resolve().parent
 TOML_PATH: Path = ROOT / "project.toml"
@@ -351,8 +352,10 @@ def _write_sync_lock(file_shas: dict[str, str]) -> None:
     SYNC_LOCK_PATH.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
 
 
-def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str]]:
-    # Returns {target_relpath: (template_name, blob_sha)}, last-template-wins on conflicts.
+def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str, bool]]:
+    # Returns {target_relpath: (template_name, blob_sha, write_once)}, last-template-wins on conflicts.
+    # Files under `templates/<name>/_write_once_/<rest>` are scaffold: write only if absent,
+    # not tracked in the lock. Everything else is managed (overwrite-on-change, lock-tracked).
     url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
     data = _github_fetch_json(url, context="template tree")
     if not isinstance(data, dict):
@@ -361,7 +364,7 @@ def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str]]:
     if data.get("truncated"):
         print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
 
-    by_template: dict[str, dict[str, str]] = {t: {} for t in templates}
+    by_template: dict[str, dict[str, tuple[str, bool]]] = {t: {} for t in templates}
     # Longest prefix first so nested names like "cpp/foo" claim their subtree
     # before a broader "cpp" entry can swallow it.
     template_prefixes = sorted(
@@ -369,23 +372,28 @@ def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str]]:
         key=lambda p: len(p[1]),
         reverse=True,
     )
+    write_once_marker = f"{WRITE_ONCE_DIR}/"
     for entry in data.get("tree", []):
         if entry.get("type") != "blob":
             continue
         path = entry.get("path", "")
         for tname, tprefix in template_prefixes:
             if path.startswith(tprefix):
-                by_template[tname][path[len(tprefix):]] = entry["sha"]
+                rest = path[len(tprefix):]
+                if rest.startswith(write_once_marker):
+                    by_template[tname][rest[len(write_once_marker):]] = (entry["sha"], True)
+                else:
+                    by_template[tname][rest] = (entry["sha"], False)
                 break
 
     missing = [t for t in templates if not by_template[t]]
     if missing:
         print(f"warning: no files found for template(s): {', '.join(missing)}", file=sys.stderr)
 
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, tuple[str, str, bool]] = {}
     for tname in templates:
-        for rel, sha in by_template[tname].items():
-            result[rel] = (tname, sha)
+        for rel, (sha, write_once) in by_template[tname].items():
+            result[rel] = (tname, sha, write_once)
     return result
 
 
@@ -411,9 +419,21 @@ def sync(cfg: Config) -> None:
 
     written = 0
     skipped = 0
-    for path, (tname, sha) in sorted(new_files.items()):
-        new_lock[path] = sha
+    seeded = 0
+    preserved = 0
+    for path, (tname, sha, write_once) in sorted(new_files.items()):
         target = ROOT / path
+        if write_once:
+            if target.exists():
+                preserved += 1
+                continue
+            content = _github_blob_bytes(sha)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            print(f"  seeded {path}  ({tname})")
+            seeded += 1
+            continue
+        new_lock[path] = sha
         if old_lock.get(path) == sha and target.exists():
             skipped += 1
             continue
@@ -435,7 +455,10 @@ def sync(cfg: Config) -> None:
                 print(f"  could not delete {path}: {e}", file=sys.stderr)
 
     _write_sync_lock(new_lock)
-    print(f"sync done: {written} written, {skipped} unchanged, {deleted} deleted")
+    print(
+        f"sync done: {written} written, {skipped} unchanged, "
+        f"{seeded} seeded, {preserved} preserved, {deleted} deleted"
+    )
 
 
 def self_update() -> None:

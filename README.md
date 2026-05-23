@@ -171,6 +171,25 @@ What it does:
 - Files that were in the previous sync but are no longer in any listed template get deleted.
 - `.project-sync.lock` is written at the repo root after each sync. **Commit it to git** so deletions propagate across machines and CI.
 
+### Write-once files (`_write_once_/`)
+
+Sometimes a template ships a file you only want as a starter — `xmake.lua`, an initial config, a stub — and after the first sync the consumer takes it over. The template author declares this by putting those files under a `_write_once_/` subfolder inside the template:
+
+```
+templates/cpp/xmake/
+├── clang_tidy.config          ← managed (overwritten on change)
+└── _write_once_/
+    └── xmake.lua              ← seeded once, then left alone forever
+```
+
+Behavior of files under `_write_once_/`:
+
+- The `_write_once_/` segment is stripped from the destination path: the file above lands at `./xmake.lua`, not `./_write_once_/xmake.lua`.
+- On first sync (file absent locally): written. On every sync after that (file exists): left alone, untouched.
+- Never tracked in `.project-sync.lock`. Never deleted by sync. The consumer owns the file after the first sync.
+
+`_write_once_` is a reserved folder name at the top level of any template — you can't ship a literal `./_write_once_/` directory into a consumer repo through sync.
+
 `sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately.
 
 ---
