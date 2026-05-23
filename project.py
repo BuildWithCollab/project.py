@@ -347,6 +347,12 @@ def init(preset: str | None = None) -> None:
         print("running sync...")
         sync(cfg)
 
+    setup_tasks = resolve_command("setup", cfg)
+    if setup_tasks:
+        print("running setup...")
+        for spec in setup_tasks:
+            call(spec, cfg)
+
 
 # --- GitHub helpers + self-update ---
 
@@ -704,7 +710,10 @@ examples of [commands] and per-task config sections.
 
 With <preset>, fetches presets/<preset>.toml from the project.py
 repo on GitHub, prepends a [project] section using the current
-directory name, writes the result, and auto-runs sync. Requires
+directory name, writes the result, and then chains:
+  - sync, if the preset defines [sync].templates
+  - the `setup` command, if the preset defines one
+…so a single `init <preset>` fully bootstraps the repo. Requires
 GH_TOKEN.
 
 Refuses to overwrite an existing project.toml.""",

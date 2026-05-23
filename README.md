@@ -284,7 +284,10 @@ python project.py lint --fix         # cfg.args == ["--fix"]
 
 ## Presets — bootstrap a new repo in one command
 
-`init <preset>` fetches a pre-configured starter from `presets/<name>.toml` in this repo, writes it to your `project.toml`, and then auto-runs `sync` so your template files land immediately.
+`init <preset>` fetches a pre-configured starter from `presets/<name>.toml` in this repo, writes it to your `project.toml`, and then chains two more steps so the repo is fully bootstrapped in one command:
+
+1. **sync** — if the preset defines `[sync].templates`, pull those template files in.
+2. **setup** — if the preset defines a `setup` command, run it. (Platform suffixes like `"setup:windows"` are honored.)
 
 ```bash
 GH_TOKEN=ghp_xxx python project.py init cpp
@@ -293,7 +296,8 @@ GH_TOKEN=ghp_xxx python project.py init cpp
 After that one command, the consumer's repo has:
 
 - A `project.toml` with `[commands]`, `[sync]`, and any per-task config sections already filled in.
-- All template files from `[sync].templates` already synced in (including any `_write_once_/` scaffolds).
+- All template files from `[sync].templates` synced in (including `_write_once_/` scaffolds and `_append_/` blocks merged into files like `.gitignore`).
+- The `setup` command already executed (e.g. `xmake config` ran, build directory is configured, etc.).
 - A `.project-sync.lock` ready to commit.
 
 ### Writing a preset
