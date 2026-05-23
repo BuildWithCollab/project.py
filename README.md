@@ -64,8 +64,9 @@ A task reference is either:
 | -------------------------------------- | ---------------------------------------------------------------------- |
 | `clang_tidy`                           | A built-in function (top-level function in `project.py`).              |
 | `scripts.somethingcustom:do_custom`    | A function in a repo-local Python file. Dotted path → file, `:` → attr. |
+| `$rm -rf build/` or `$ rm -rf build/`  | A shell one-liner. The space after `$` is optional. Runs through the OS shell (`cmd.exe` on Windows, `/bin/sh` elsewhere). |
 
-The `:` is only needed when referencing something outside `project.py` — it separates the module path from the attribute.
+The `:` is only needed when referencing something outside `project.py` — it separates the module path from the attribute. The `$` prefix marks a shell command — the rest of the string is passed to the OS shell as-is.
 
 ### Platform-specific commands
 
@@ -79,6 +80,14 @@ lint:windows = ["scripts.lint:choco_tidy"]
 ```
 
 On macOS, `python project.py lint` runs `scripts.lint:brew_tidy`. On Linux, it falls back to `clang_tidy`. The fallback chain is `<name>:<current-platform>` first, then `<name>`.
+
+Pairs naturally with shell commands when the OS shell differs:
+
+```toml
+[commands]
+clean         = ["$rm -rf build/"]
+clean:windows = ["$rmdir /s /q build"]
+```
 
 ---
 

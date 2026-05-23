@@ -231,6 +231,13 @@ def resolve_command(name: str, cfg: Config) -> list[str]:
 
 
 def call(spec: str, cfg: Config) -> None:
+    if spec.startswith("$"):
+        cmd = spec[1:].lstrip()
+        if not cmd:
+            raise SystemExit(f"empty shell command: {spec!r}")
+        run(cmd, shell=True)
+        return
+
     if ":" in spec:
         # module.path:attr -> importlib (e.g. scripts.deploy.staging:go)
         head, _, attr = spec.partition(":")
