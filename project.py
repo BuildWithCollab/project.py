@@ -694,8 +694,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # `argparse.REMAINDER` for `args` captures everything after the command, including
+    # `-h` / `--help` / `--version`. Intercept those before argparse so they work no
+    # matter where they appear on the command line.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw or "-h" in raw or "--help" in raw:
+        build_parser().print_help()
+        return 0
+    if "--version" in raw:
+        print(__version__)
+        return 0
+
     parser = build_parser()
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(raw)
 
     if ns.command == "self-update":
         self_update()
