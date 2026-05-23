@@ -1,0 +1,2 @@
+[sync]
+templates = ["licenses/0BSD", "git", "cpp/base", "cpp/xmake"]

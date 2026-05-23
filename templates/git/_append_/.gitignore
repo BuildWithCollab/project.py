@@ -1,0 +1,8 @@
+# C++
+build
+compile_commands
+.xmake
+
+# Agent handoff or kickoff documents (keep local, never commit)
+*[Hh][Aa][Nn][Dd][Oo][Ff][Ff]*
+*[Kk][Ii][Cc][Kk][Oo][Ff][Ff]*
