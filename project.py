@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import importlib
 import json
 import os
@@ -66,7 +67,7 @@ def platform() -> Platform:
 
 @dataclass
 class Config:
-    name: str = ""
+    project: dict[str, Any] = field(default_factory=dict)
     commands: dict[str, list[str]] = field(default_factory=dict)
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
@@ -78,7 +79,7 @@ class Config:
         with path.open("rb") as f:
             data = tomllib.load(f)
         return cls(
-            name=data.get("project", {}).get("name", ""),
+            project=data.get("project", {}),
             commands=data.get("commands", {}),
             tools={k: v for k, v in data.items() if k not in {"project", "commands"}},
         )
@@ -390,11 +391,12 @@ def _github_blob_bytes(sha: str) -> bytes:
 
 # --- sync ---
 
-def _read_sync_lock() -> tuple[dict[str, str], set[str]]:
-    # Returns (managed_path -> sha, append_paths). Pre-section files (no [managed]/[append]
-    # headers) are treated as all-managed for backward compat.
+def _read_sync_lock() -> tuple[str, dict[str, str], set[str]]:
+    # Returns (cfg_hash, managed_path -> sha, append_paths). Pre-section files (no
+    # [cfg_hash]/[managed]/[append] headers) are treated as all-managed for backward compat.
     if not SYNC_LOCK_PATH.exists():
-        return {}, set()
+        return "", {}, set()
+    cfg_hash = ""
     managed: dict[str, str] = {}
     append: set[str] = set()
     section = "managed"
@@ -405,17 +407,24 @@ def _read_sync_lock() -> tuple[dict[str, str], set[str]]:
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
             continue
-        if section == "managed":
+        if section == "cfg_hash":
+            cfg_hash = line
+        elif section == "managed":
             sha, _, path = line.partition("  ")
             if sha and path:
                 managed[path] = sha
         elif section == "append":
             append.add(line)
-    return managed, append
+    return cfg_hash, managed, append
 
 
-def _write_sync_lock(managed: dict[str, str], append: set[str]) -> None:
-    lines = ["# .project-sync.lock — written by `project.py sync`. Do not edit."]
+def _write_sync_lock(cfg_hash: str, managed: dict[str, str], append: set[str]) -> None:
+    lines = [
+        "# .project-sync.lock — written by `project.py sync`. Do not edit.",
+        "",
+        "[cfg_hash]",
+        cfg_hash,
+    ]
     if managed:
         lines.append("")
         lines.append("[managed]")
@@ -427,6 +436,57 @@ def _write_sync_lock(managed: dict[str, str], append: set[str]) -> None:
         for path in sorted(append):
             lines.append(path)
     SYNC_LOCK_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --- variable substitution: {{section.key}} ---
+
+_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*)\s*\}\}")
+
+
+def _scalar(v: Any) -> str | None:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (str, int, float)):
+        return str(v)
+    return None
+
+
+def _build_var_lookup(cfg: Config) -> dict[str, str]:
+    flat: dict[str, str] = {}
+    for k, v in cfg.project.items():
+        s = _scalar(v)
+        if s is not None:
+            flat[f"project.{k}"] = s
+    for section, body in cfg.tools.items():
+        if not isinstance(body, dict):
+            continue
+        for k, v in body.items():
+            s = _scalar(v)
+            if s is not None:
+                flat[f"{section}.{k}"] = s
+    return flat
+
+
+def _substitute(content: bytes, lookup: dict[str, str]) -> bytes:
+    if not lookup:
+        return content
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    new_text = _VAR_RE.sub(lambda m: lookup.get(m.group(1), m.group(0)), text)
+    if new_text == text:
+        return content
+    return new_text.encode("utf-8")
+
+
+def _cfg_hash(cfg: Config) -> str:
+    payload = json.dumps(
+        {"project": cfg.project, "tools": cfg.tools},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _list_template_files(
@@ -597,7 +657,10 @@ def sync(cfg: Config) -> None:
 
     print(f"syncing {len(templates)} template(s): {', '.join(templates)}")
     managed, write_once, append = _list_template_files(templates)
-    old_managed, old_append = _read_sync_lock()
+    old_cfg_hash, old_managed, old_append = _read_sync_lock()
+    new_cfg_hash = _cfg_hash(cfg)
+    cfg_changed = new_cfg_hash != old_cfg_hash
+    lookup = _build_var_lookup(cfg)
     new_managed: dict[str, str] = {}
 
     written = 0
@@ -607,10 +670,10 @@ def sync(cfg: Config) -> None:
     for path, (tname, sha) in sorted(managed.items()):
         target = ROOT / path
         new_managed[path] = sha
-        if old_managed.get(path) == sha and target.exists():
+        if not cfg_changed and old_managed.get(path) == sha and target.exists():
             skipped += 1
             continue
-        content = _github_blob_bytes(sha)
+        content = _substitute(_github_blob_bytes(sha), lookup)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         print(f"  wrote {path}  ({tname})")
@@ -621,7 +684,7 @@ def sync(cfg: Config) -> None:
         if target.exists():
             preserved += 1
             continue
-        content = _github_blob_bytes(sha)
+        content = _substitute(_github_blob_bytes(sha), lookup)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         print(f"  seeded {path}  ({tname})")
@@ -639,7 +702,8 @@ def sync(cfg: Config) -> None:
         target = ROOT / path
         blocks: dict[str, str] = {}
         for tname, sha in entries:
-            blocks[tname] = _github_blob_bytes(sha).decode("utf-8")
+            blob = _substitute(_github_blob_bytes(sha), lookup)
+            blocks[tname] = blob.decode("utf-8")
         if _merge_append_blocks(target, blocks):
             print(f"  merged {path}  ({', '.join(t for t, _ in entries)})")
             merged += 1
@@ -664,7 +728,7 @@ def sync(cfg: Config) -> None:
             print(f"  unmerged {path}")
             stripped += 1
 
-    _write_sync_lock(new_managed, new_append_paths)
+    _write_sync_lock(new_cfg_hash, new_managed, new_append_paths)
     print(
         f"sync done: {written} written, {skipped} unchanged, "
         f"{seeded} seeded, {preserved} preserved, "

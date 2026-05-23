@@ -258,6 +258,44 @@ The append paths are tracked in `.project-sync.lock` under an `[append]` section
 
 Marker format uses `#` as the comment character, which works for `.gitignore`, `.gitattributes`, `.editorconfig`, dotenv files, requirements.txt, and most line-oriented config formats. Files that use a different comment syntax (JSON, HTML, etc.) aren't supported.
 
+### Variable substitution
+
+Template files can reference any scalar value from the consumer's `project.toml` using `{{section.key}}`. Substitution runs on every synced file before it's written.
+
+```toml
+# consumer's project.toml
+[project]
+name = "my-game"
+license = "0BSD"
+
+[clang_tidy]
+binary = "clang-tidy-21"
+```
+
+```lua
+-- templates/cpp/xmake/_write_once_/xmake.lua
+set_project("{{project.name}}")
+set_license("{{project.license}}")
+```
+
+After sync, the consumer's `xmake.lua` reads:
+
+```lua
+set_project("my-game")
+set_license("0BSD")
+```
+
+Rules:
+
+- **Addressable**: any top-level table in `project.toml`. `{{project.name}}`, `{{project.license}}`, `{{clang_tidy.binary}}`, `{{clang_tidy.jobs}}`, etc.
+- **Scalars only**: `str` / `int` / `float` / `bool` are stringified (booleans render as `true`/`false`). Lists and nested tables are skipped — `{{commands.setup}}` won't substitute.
+- **Lenient**: unknown patterns are left alone. `{{not.a.real.key}}` stays in the file as-is, so templates can contain literal `{{...}}` content (e.g. Vue/Handlebars snippets) without breaking.
+- **Single braces are safe**: `{...}` is never substituted, so Lua tables (`{1, 2, 3}`), C++ initializer lists (`{0, 0, 0}`), and JSON all pass through untouched.
+- **Text only**: files that fail UTF-8 decoding (images, binaries) are written through byte-for-byte.
+- **Applies to**: managed files (every write), write-once files (only when first seeded), and append-block bodies (substituted into the block before merging).
+
+Config changes propagate automatically: `.project-sync.lock` stores a hash of the relevant config sections, and sync re-renders all files whenever that hash changes — so renaming `project.name` and re-running `sync` actually updates references across every synced file.
+
 `sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately.
 
 ---
