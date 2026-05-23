@@ -275,6 +275,15 @@ name = "{name}"
 #
 # [npm_install]
 # package_manager = "pnpm"
+
+# --- sync ---
+# `python project.py sync` pulls files from this repo's templates/<name>/
+# folders into your project. Names can be nested (e.g. "cpp/xmake").
+# Requires GH_TOKEN. Last template wins on file conflicts.
+# Writes .project-sync.lock — commit it so deletions propagate.
+#
+# [sync]
+# templates = ["python-base", "github-actions"]
 """
 
 
