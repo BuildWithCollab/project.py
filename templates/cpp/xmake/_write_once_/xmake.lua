@@ -1,34 +1,31 @@
-includes("xmake/test.lua")
+includes("xmake/*.lua")
 
--- set_project("collab.platform")
+set_project("{{project.name}}")
 
--- add_rules("mode.release")
--- set_defaultmode("release")
+add_rules("mode.release")
+set_defaultmode("release")
 
--- set_languages("c++23")
--- set_warnings("all", "extra")
--- set_encodings("utf-8")
--- set_policy("build.c++.modules", true)
+set_languages("c++23")
 
--- option("build_tests")
---     set_default(true)
---     set_showmenu(true)
---     set_description("Build test targets")
--- option_end()
+set_warnings("all", "extra")
+set_encodings("utf-8")
+set_policy("build.c++.modules", true)
 
--- option("build_examples")
---     set_default(true)
---     set_showmenu(true)
---     set_description("Build example binaries")
--- option_end()
+option("build_tests")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Build test targets")
+option_end()
 
--- includes("xmake/collab.lua")
+option("build_examples")
+    set_default(true)
+    set_showmenu(true)
+    set_description("Build example binaries")
+option_end()
 
--- add_collab_requires("collab.core")
-
--- if get_config("build_tests") then
---     add_requires("catch2")
--- end
+if get_config("build_tests") then
+    add_requires("catch2")
+end
 
 -- includes("lib/collab.platform/xmake.lua")
 
