@@ -693,15 +693,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_COMMAND_HELP = {
+    "init": """\
+usage: project.py init [<preset>]
+
+Write a starter project.toml in the current directory.
+
+Without an argument, writes a default skeleton with commented-out
+examples of [commands] and per-task config sections.
+
+With <preset>, fetches presets/<preset>.toml from the project.py
+repo on GitHub, prepends a [project] section using the current
+directory name, writes the result, and auto-runs sync. Requires
+GH_TOKEN.
+
+Refuses to overwrite an existing project.toml.""",
+    "sync": """\
+usage: project.py sync
+
+Pull template files from the project.py repo's templates/ folder
+into the current project, according to [sync].templates in
+project.toml.
+
+File categories within each template folder:
+  <name>/<rest>                 managed (overwrite-on-change)
+  <name>/_write_once_/<rest>    scaffold (write only if absent)
+  <name>/_append_/<rest>        block-merged into <rest>
+
+State is tracked in .project-sync.lock — commit it to git so
+deletions and append-block changes propagate across machines.
+
+Requires GH_TOKEN.""",
+    "self-update": """\
+usage: project.py self-update
+
+Replace project.py in the current directory with the latest version
+from the project.py repo on GitHub. No-op if already up to date.
+
+GH_TOKEN is optional but recommended — avoids unauthenticated
+GitHub rate limits.""",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
-    # `argparse.REMAINDER` for `args` captures everything after the command, including
-    # `-h` / `--help` / `--version`. Intercept those before argparse so they work no
-    # matter where they appear on the command line.
+    # `argparse.REMAINDER` swallows `-h` / `--help` / `--version` when they appear
+    # after the command. Intercept those before argparse so help and version work
+    # no matter where they're typed.
     raw = list(sys.argv[1:] if argv is None else argv)
-    if not raw or "-h" in raw or "--help" in raw:
+
+    # Per-built-in help: `init -h`, `sync --help`, etc. show command-specific help.
+    if raw and raw[0] in _COMMAND_HELP and ("-h" in raw[1:] or "--help" in raw[1:]):
+        print(_COMMAND_HELP[raw[0]])
+        return 0
+
+    # Top-level: no args at all, or -h/--help in the leading position.
+    if not raw or raw[0] in ("-h", "--help"):
         build_parser().print_help()
         return 0
-    if "--version" in raw:
+    if raw[0] == "--version":
         print(__version__)
         return 0
 
