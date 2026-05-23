@@ -67,6 +67,19 @@ A task reference is either:
 
 The `:` is only needed when referencing something outside `project.py` — it separates the module path from the attribute.
 
+### Platform-specific commands
+
+Suffix a command name with `:windows`, `:macos`, or `:linux` to override its tasks on that platform. The platform-specific entry wins if it exists; otherwise sync falls back to the plain name.
+
+```toml
+[commands]
+lint         = ["clang_tidy"]            # default for any OS not covered below
+lint:macos   = ["scripts.lint:brew_tidy"]
+lint:windows = ["scripts.lint:choco_tidy"]
+```
+
+On macOS, `python project.py lint` runs `scripts.lint:brew_tidy`. On Linux, it falls back to `clang_tidy`. The fallback chain is `<name>:<current-platform>` first, then `<name>`.
+
 ---
 
 ## Built-in tasks

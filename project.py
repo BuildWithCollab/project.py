@@ -214,7 +214,19 @@ def ruff(cfg: Config) -> None:
 
 # --- Resolver ---
 
+_PLATFORM_SUFFIX = {
+    Platform.WINDOWS: "windows",
+    Platform.MAC: "macos",
+    Platform.LINUX: "linux",
+}
+
+
 def resolve_command(name: str, cfg: Config) -> list[str]:
+    # Platform-specific overrides win: `name:windows` / `name:macos` / `name:linux`
+    # falls back to the plain `name` if no platform-suffixed entry exists.
+    plat_key = f"{name}:{_PLATFORM_SUFFIX[platform()]}"
+    if plat_key in cfg.commands:
+        return list(cfg.commands[plat_key])
     return list(cfg.commands.get(name, []))
 
 
