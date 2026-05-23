@@ -39,6 +39,7 @@ SELF_UPDATE_PATH = "project.py"
 TEMPLATES_REF = "main"
 TEMPLATES_DIR = "templates"
 WRITE_ONCE_DIR = "_write_once_"
+APPEND_DIR = "_append_"
 
 ROOT: Path = Path(__file__).resolve().parent
 TOML_PATH: Path = ROOT / "project.toml"
@@ -332,30 +333,58 @@ def _github_blob_bytes(sha: str) -> bytes:
 
 # --- sync ---
 
-def _read_sync_lock() -> dict[str, str]:
+def _read_sync_lock() -> tuple[dict[str, str], set[str]]:
+    # Returns (managed_path -> sha, append_paths). Pre-section files (no [managed]/[append]
+    # headers) are treated as all-managed for backward compat.
     if not SYNC_LOCK_PATH.exists():
-        return {}
-    out: dict[str, str] = {}
+        return {}, set()
+    managed: dict[str, str] = {}
+    append: set[str] = set()
+    section = "managed"
     for raw in SYNC_LOCK_PATH.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        sha, _, path = line.partition("  ")
-        if sha and path:
-            out[path] = sha
-    return out
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section == "managed":
+            sha, _, path = line.partition("  ")
+            if sha and path:
+                managed[path] = sha
+        elif section == "append":
+            append.add(line)
+    return managed, append
 
 
-def _write_sync_lock(file_shas: dict[str, str]) -> None:
-    header = "# .project-sync.lock — written by `project.py sync`. Do not edit.\n"
-    body = "\n".join(f"{sha}  {path}" for path, sha in sorted(file_shas.items()))
-    SYNC_LOCK_PATH.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+def _write_sync_lock(managed: dict[str, str], append: set[str]) -> None:
+    lines = ["# .project-sync.lock — written by `project.py sync`. Do not edit."]
+    if managed:
+        lines.append("")
+        lines.append("[managed]")
+        for path in sorted(managed):
+            lines.append(f"{managed[path]}  {path}")
+    if append:
+        lines.append("")
+        lines.append("[append]")
+        for path in sorted(append):
+            lines.append(path)
+    SYNC_LOCK_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str, bool]]:
-    # Returns {target_relpath: (template_name, blob_sha, write_once)}, last-template-wins on conflicts.
-    # Files under `templates/<name>/_write_once_/<rest>` are scaffold: write only if absent,
-    # not tracked in the lock. Everything else is managed (overwrite-on-change, lock-tracked).
+def _list_template_files(
+    templates: list[str],
+) -> tuple[
+    dict[str, tuple[str, str]],       # managed: target_path -> (template, sha)
+    dict[str, tuple[str, str]],       # write_once: target_path -> (template, sha)
+    list[tuple[str, str, str]],       # append: ordered [(template, target_path, sha)]
+]:
+    # Sorts each template's files into one of three buckets based on its in-template path:
+    #   _write_once_/<rest>   -> write_once, lands at <rest>
+    #   _append_/<rest>       -> append, block injected into <rest>
+    #   <rest>                -> managed (overwrite-on-change), lands at <rest>
+    # Managed: last template in the user's list wins on conflicts.
+    # Append: every contributing template gets its own block in the destination file, in list order.
     url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
     data = _github_fetch_json(url, context="template tree")
     if not isinstance(data, dict):
@@ -364,7 +393,8 @@ def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str, bool
     if data.get("truncated"):
         print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
 
-    by_template: dict[str, dict[str, tuple[str, bool]]] = {t: {} for t in templates}
+    Bucket = tuple[str, str, str]  # (kind, target_relpath, sha)
+    by_template: dict[str, list[Bucket]] = {t: [] for t in templates}
     # Longest prefix first so nested names like "cpp/foo" claim their subtree
     # before a broader "cpp" entry can swallow it.
     template_prefixes = sorted(
@@ -373,6 +403,7 @@ def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str, bool
         reverse=True,
     )
     write_once_marker = f"{WRITE_ONCE_DIR}/"
+    append_marker = f"{APPEND_DIR}/"
     for entry in data.get("tree", []):
         if entry.get("type") != "blob":
             continue
@@ -381,20 +412,115 @@ def _list_template_files(templates: list[str]) -> dict[str, tuple[str, str, bool
             if path.startswith(tprefix):
                 rest = path[len(tprefix):]
                 if rest.startswith(write_once_marker):
-                    by_template[tname][rest[len(write_once_marker):]] = (entry["sha"], True)
+                    by_template[tname].append(("write_once", rest[len(write_once_marker):], entry["sha"]))
+                elif rest.startswith(append_marker):
+                    by_template[tname].append(("append", rest[len(append_marker):], entry["sha"]))
                 else:
-                    by_template[tname][rest] = (entry["sha"], False)
+                    by_template[tname].append(("managed", rest, entry["sha"]))
                 break
 
     missing = [t for t in templates if not by_template[t]]
     if missing:
         print(f"warning: no files found for template(s): {', '.join(missing)}", file=sys.stderr)
 
-    result: dict[str, tuple[str, str, bool]] = {}
+    managed: dict[str, tuple[str, str]] = {}
+    write_once: dict[str, tuple[str, str]] = {}
+    append: list[tuple[str, str, str]] = []
     for tname in templates:
-        for rel, (sha, write_once) in by_template[tname].items():
-            result[rel] = (tname, sha, write_once)
-    return result
+        for kind, rel, sha in by_template[tname]:
+            if kind == "managed":
+                managed[rel] = (tname, sha)
+            elif kind == "write_once":
+                write_once[rel] = (tname, sha)
+            else:  # append
+                append.append((tname, rel, sha))
+
+    # If any path appears as append, that wins over managed for the same path.
+    # Warn so template authors notice the conflict.
+    append_targets = {p for _, p, _ in append}
+    conflicts = sorted(set(managed) & append_targets)
+    for c in conflicts:
+        print(f"warning: {c!r} is both managed and append; treating as append", file=sys.stderr)
+        managed.pop(c, None)
+
+    return managed, write_once, append
+
+
+# --- append-block merge ---
+
+_BLOCK_START_RE = re.compile(r"# \[START (.+?)\]")
+
+
+def _format_append_block(name: str, body: str) -> str:
+    return f"# [START {name}]\n{body.rstrip(chr(10))}\n# [END {name}]\n"
+
+
+def _merge_append_blocks(file_path: Path, blocks: dict[str, str]) -> bool:
+    # blocks: {template_name: block body without markers}. Returns True if file changed on disk.
+    # Replaces existing # [START name] / # [END name] regions in place; appends new blocks
+    # at the end; strips blocks whose template name is not in `blocks`.
+    existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
+    new = existing
+
+    existing_names = set(_BLOCK_START_RE.findall(new))
+    wanted_names = set(blocks)
+
+    # Replace blocks we want and that already exist
+    for name in wanted_names & existing_names:
+        pattern = re.compile(
+            r"# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
+            re.DOTALL,
+        )
+        new = pattern.sub(_format_append_block(name, blocks[name]), new, count=1)
+
+    # Strip blocks we no longer want (and any single trailing blank line that follows)
+    for name in existing_names - wanted_names:
+        pattern = re.compile(
+            r"\n?# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
+            re.DOTALL,
+        )
+        new = pattern.sub("", new, count=1)
+
+    # Append new blocks for templates not previously present
+    for name in (n for n in blocks if n not in existing_names):
+        if new and not new.endswith("\n"):
+            new += "\n"
+        if new and not new.endswith("\n\n"):
+            new += "\n"
+        new += _format_append_block(name, blocks[name])
+
+    # Collapse runs of 3+ blank lines to 2
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    if new and not new.endswith("\n"):
+        new += "\n"
+
+    if new == existing:
+        return False
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(new, encoding="utf-8")
+    return True
+
+
+def _strip_all_our_blocks(file_path: Path) -> bool:
+    # Strip every `# [START …]` / `# [END …]` block from a file that's no longer an append target.
+    # Returns True if file changed; deletes the file if it becomes empty.
+    if not file_path.exists():
+        return False
+    existing = file_path.read_text(encoding="utf-8")
+    new = re.sub(
+        r"\n?# \[START .+?\]\n.*?\n# \[END .+?\]\n?",
+        "",
+        existing,
+        flags=re.DOTALL,
+    )
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    if new.strip() == "":
+        file_path.unlink()
+        return True
+    if new == existing:
+        return False
+    file_path.write_text(new, encoding="utf-8")
+    return True
 
 
 def sync(cfg: Config) -> None:
@@ -413,28 +539,18 @@ def sync(cfg: Config) -> None:
         raise SystemExit(1)
 
     print(f"syncing {len(templates)} template(s): {', '.join(templates)}")
-    new_files = _list_template_files(templates)
-    old_lock = _read_sync_lock()
-    new_lock: dict[str, str] = {}
+    managed, write_once, append = _list_template_files(templates)
+    old_managed, old_append = _read_sync_lock()
+    new_managed: dict[str, str] = {}
 
     written = 0
     skipped = 0
     seeded = 0
     preserved = 0
-    for path, (tname, sha, write_once) in sorted(new_files.items()):
+    for path, (tname, sha) in sorted(managed.items()):
         target = ROOT / path
-        if write_once:
-            if target.exists():
-                preserved += 1
-                continue
-            content = _github_blob_bytes(sha)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            print(f"  seeded {path}  ({tname})")
-            seeded += 1
-            continue
-        new_lock[path] = sha
-        if old_lock.get(path) == sha and target.exists():
+        new_managed[path] = sha
+        if old_managed.get(path) == sha and target.exists():
             skipped += 1
             continue
         content = _github_blob_bytes(sha)
@@ -443,8 +559,37 @@ def sync(cfg: Config) -> None:
         print(f"  wrote {path}  ({tname})")
         written += 1
 
+    for path, (tname, sha) in sorted(write_once.items()):
+        target = ROOT / path
+        if target.exists():
+            preserved += 1
+            continue
+        content = _github_blob_bytes(sha)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        print(f"  seeded {path}  ({tname})")
+        seeded += 1
+
+    # Group append entries by destination path, preserving template list order per path.
+    append_by_target: dict[str, list[tuple[str, str]]] = {}
+    for tname, path, sha in append:
+        append_by_target.setdefault(path, []).append((tname, sha))
+
+    merged = 0
+    new_append_paths: set[str] = set()
+    for path, entries in sorted(append_by_target.items()):
+        new_append_paths.add(path)
+        target = ROOT / path
+        blocks: dict[str, str] = {}
+        for tname, sha in entries:
+            blocks[tname] = _github_blob_bytes(sha).decode("utf-8")
+        if _merge_append_blocks(target, blocks):
+            print(f"  merged {path}  ({', '.join(t for t, _ in entries)})")
+            merged += 1
+
+    # Delete managed files that fell out — but not if they're now append targets.
     deleted = 0
-    for path in sorted(set(old_lock) - set(new_lock)):
+    for path in sorted(set(old_managed) - set(new_managed) - new_append_paths):
         target = ROOT / path
         if target.exists():
             try:
@@ -454,10 +599,19 @@ def sync(cfg: Config) -> None:
             except OSError as e:
                 print(f"  could not delete {path}: {e}", file=sys.stderr)
 
-    _write_sync_lock(new_lock)
+    # Strip our blocks from files that used to be append targets but aren't anymore.
+    stripped = 0
+    for path in sorted(old_append - new_append_paths - set(new_managed)):
+        target = ROOT / path
+        if _strip_all_our_blocks(target):
+            print(f"  unmerged {path}")
+            stripped += 1
+
+    _write_sync_lock(new_managed, new_append_paths)
     print(
         f"sync done: {written} written, {skipped} unchanged, "
-        f"{seeded} seeded, {preserved} preserved, {deleted} deleted"
+        f"{seeded} seeded, {preserved} preserved, "
+        f"{merged} merged, {stripped} unmerged, {deleted} deleted"
     )
 
 

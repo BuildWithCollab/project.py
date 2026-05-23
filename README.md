@@ -190,6 +190,50 @@ Behavior of files under `_write_once_/`:
 
 `_write_once_` is a reserved folder name at the top level of any template — you can't ship a literal `./_write_once_/` directory into a consumer repo through sync.
 
+### Append blocks (`_append_/`)
+
+For files that need contributions from *multiple* templates plus user-specific lines — `.gitignore` is the poster child — put them under `_append_/`. Each contributing template's content is injected as a marker-delimited block. The user's own content lives anywhere outside the markers and is never touched.
+
+```
+templates/cpp/xmake/
+└── _append_/
+    └── .gitignore             ← contributes a block to ./.gitignore
+
+templates/rust/
+└── _append_/
+    └── .gitignore             ← contributes another block to ./.gitignore
+```
+
+Result on the consumer's disk (with `templates = ["cpp/xmake", "rust"]`):
+
+```gitignore
+# user's own lines (live anywhere outside markers)
+secrets.toml
+.env
+
+# [START cpp/xmake]
+build/
+*.o
+# [END cpp/xmake]
+
+# [START rust]
+target/
+# [END rust]
+```
+
+Behavior of files under `_append_/`:
+
+- Each contributing template gets its own `# [START <template>]` / `# [END <template>]` block in the destination file. Block name is the full template name.
+- Block updates propagate: if a template changes its `_append_/.gitignore`, the matching block's content is replaced in place on the next sync.
+- Block removals propagate: if a template stops shipping `_append_/.gitignore`, or is removed from `[sync].templates`, its block is stripped on the next sync.
+- Content **outside** all marker blocks is the user's. Sync never touches it.
+- Content **inside** a marker block is owned by the template. Local edits there get overwritten on the next sync — that's the deal.
+- If a file's last managed block is stripped and only user content remains, the file is kept. If nothing remains, the file is deleted.
+
+The append paths are tracked in `.project-sync.lock` under an `[append]` section so blocks can be stripped cleanly even when a template gets removed from the list entirely.
+
+Marker format uses `#` as the comment character, which works for `.gitignore`, `.gitattributes`, `.editorconfig`, dotenv files, requirements.txt, and most line-oriented config formats. Files that use a different comment syntax (JSON, HTML, etc.) aren't supported.
+
 `sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately.
 
 ---
