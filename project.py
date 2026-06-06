@@ -309,13 +309,8 @@ name = "{name}"
 """
 
 
-def _fetch_preset(name: str) -> str:
-    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/presets/{name}.toml?ref={TEMPLATES_REF}"
-    data = _github_fetch_json(url, context=f"preset {name!r}")
-    if not isinstance(data, dict) or "content" not in data:
-        print(f"preset {name!r}: unexpected response", file=sys.stderr)
-        raise SystemExit(1)
-    return base64.b64decode(data["content"]).decode("utf-8")
+def _fetch_preset(name: str, source: Source) -> str:
+    return source.read(f"presets/{name}.toml").decode("utf-8")
 
 
 def init(preset: str | None = None) -> None:
@@ -328,15 +323,10 @@ def init(preset: str | None = None) -> None:
         print(f"wrote {TOML_PATH}")
         return
 
-    if not os.environ.get("GH_TOKEN"):
-        print(
-            "init <preset> requires GH_TOKEN. Set it to a GitHub PAT "
-            "(read-only public-repo access is enough).",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+    source = get_source()
+    source.ensure_ready()
 
-    body = _fetch_preset(preset)
+    body = _fetch_preset(preset, source)
     if not body.endswith("\n"):
         body += "\n"
     header = f'[project]\nname = "{ROOT.name}"\n\n'
@@ -387,6 +377,137 @@ def _github_blob_bytes(sha: str) -> bytes:
         print(f"unexpected blob response for {sha}", file=sys.stderr)
         raise SystemExit(1)
     return base64.b64decode(data["content"])
+
+
+# --- Source: where self-update / sync / presets read from ---
+# Default is GitHub. Set PROJECT_PY_SOURCE to a local checkout of this repo to
+# read everything from disk instead — handy for developing templates/presets/
+# project.py itself without pushing. The local source computes the *same* git
+# blob shas GitHub would, so .project-sync.lock stays source-agnostic: you can
+# sync from local, push, then sync from GitHub elsewhere with no spurious churn.
+
+SOURCE_ENV = "PROJECT_PY_SOURCE"
+
+
+def _git_normalize(data: bytes) -> bytes:
+    # Mirror git's default text handling so local shas/bytes match what GitHub
+    # serves. Git stores text blobs LF-normalized (autocrlf clean), and the API
+    # returns those LF bytes — but a Windows working tree often has CRLF. Files
+    # with a NUL byte are treated as binary and passed through untouched, same
+    # as git's own text/binary heuristic.
+    if b"\x00" in data:
+        return data
+    return data.replace(b"\r\n", b"\n")
+
+
+def _git_blob_sha(data: bytes) -> str:
+    # Matches `git hash-object` on git-stored (LF-normalized) content: the sha1
+    # of "blob <len>\0" + content. Feed already-normalized bytes.
+    h = hashlib.sha1()
+    h.update(b"blob " + str(len(data)).encode() + b"\x00")
+    h.update(data)
+    return h.hexdigest()
+
+
+class Source:
+    name = "?"
+
+    def ensure_ready(self) -> None:
+        """Fail fast if this source can't be used (e.g. missing credentials)."""
+
+    def read(self, path: str) -> bytes:
+        """Read a single repo-relative file's bytes."""
+        raise NotImplementedError
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        """Every blob under templates/, as (repo-relative posix path, git sha)."""
+        raise NotImplementedError
+
+    def blob(self, sha: str) -> bytes:
+        """Read a blob's bytes by the sha returned from list_blobs()."""
+        raise NotImplementedError
+
+
+class GitHubSource(Source):
+    name = "GitHub"
+
+    def ensure_ready(self) -> None:
+        if not os.environ.get("GH_TOKEN"):
+            print(
+                "GitHub access requires GH_TOKEN. Set it to a GitHub PAT "
+                "(read-only public-repo access is enough), or set "
+                f"{SOURCE_ENV} to a local checkout.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    def read(self, path: str) -> bytes:
+        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{path}?ref={TEMPLATES_REF}"
+        data = _github_fetch_json(url, context=path)
+        if not isinstance(data, dict) or "content" not in data:
+            print(f"unexpected response for {path}", file=sys.stderr)
+            raise SystemExit(1)
+        return base64.b64decode(data["content"])
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
+        data = _github_fetch_json(url, context="template tree")
+        if not isinstance(data, dict):
+            print("unexpected tree response", file=sys.stderr)
+            raise SystemExit(1)
+        if data.get("truncated"):
+            print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
+        return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
+
+    def blob(self, sha: str) -> bytes:
+        return _github_blob_bytes(sha)
+
+
+class LocalSource(Source):
+    name = "local"
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._sha_to_path: dict[str, Path] = {}
+
+    def read(self, path: str) -> bytes:
+        target = self.root / path
+        if not target.is_file():
+            print(f"not found in local source {self.root}: {path}", file=sys.stderr)
+            raise SystemExit(1)
+        return _git_normalize(target.read_bytes())
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        self._sha_to_path = {}
+        blobs: list[tuple[str, str]] = []
+        base = self.root / TEMPLATES_DIR
+        if not base.is_dir():
+            return blobs
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            sha = _git_blob_sha(_git_normalize(p.read_bytes()))
+            rel = p.relative_to(self.root).as_posix()
+            blobs.append((rel, sha))
+            self._sha_to_path[sha] = p
+        return blobs
+
+    def blob(self, sha: str) -> bytes:
+        path = self._sha_to_path.get(sha)
+        if path is None:
+            raise SystemExit(f"local source: no blob for sha {sha[:8]} (call list_blobs first)")
+        return _git_normalize(path.read_bytes())
+
+
+def get_source() -> Source:
+    local = os.environ.get(SOURCE_ENV)
+    if not local:
+        return GitHubSource()
+    root = Path(local).expanduser().resolve()
+    if not root.is_dir():
+        print(f"{SOURCE_ENV}={local!r} is not a directory", file=sys.stderr)
+        raise SystemExit(1)
+    return LocalSource(root)
 
 
 # --- sync ---
@@ -491,6 +612,7 @@ def _cfg_hash(cfg: Config) -> str:
 
 def _list_template_files(
     templates: list[str],
+    source: Source,
 ) -> tuple[
     dict[str, tuple[str, str]],       # managed: target_path -> (template, sha)
     dict[str, tuple[str, str]],       # write_once: target_path -> (template, sha)
@@ -502,14 +624,6 @@ def _list_template_files(
     #   <rest>                -> managed (overwrite-on-change), lands at <rest>
     # Managed: last template in the user's list wins on conflicts.
     # Append: every contributing template gets its own block in the destination file, in list order.
-    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
-    data = _github_fetch_json(url, context="template tree")
-    if not isinstance(data, dict):
-        print("unexpected tree response", file=sys.stderr)
-        raise SystemExit(1)
-    if data.get("truncated"):
-        print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
-
     Bucket = tuple[str, str, str]  # (kind, target_relpath, sha)
     by_template: dict[str, list[Bucket]] = {t: [] for t in templates}
     # Longest prefix first so nested names like "cpp/foo" claim their subtree
@@ -521,19 +635,16 @@ def _list_template_files(
     )
     write_once_marker = f"{WRITE_ONCE_DIR}/"
     append_marker = f"{APPEND_DIR}/"
-    for entry in data.get("tree", []):
-        if entry.get("type") != "blob":
-            continue
-        path = entry.get("path", "")
+    for path, sha in source.list_blobs():
         for tname, tprefix in template_prefixes:
             if path.startswith(tprefix):
                 rest = path[len(tprefix):]
                 if rest.startswith(write_once_marker):
-                    by_template[tname].append(("write_once", rest[len(write_once_marker):], entry["sha"]))
+                    by_template[tname].append(("write_once", rest[len(write_once_marker):], sha))
                 elif rest.startswith(append_marker):
-                    by_template[tname].append(("append", rest[len(append_marker):], entry["sha"]))
+                    by_template[tname].append(("append", rest[len(append_marker):], sha))
                 else:
-                    by_template[tname].append(("managed", rest, entry["sha"]))
+                    by_template[tname].append(("managed", rest, sha))
                 break
 
     missing = [t for t in templates if not by_template[t]]
@@ -641,13 +752,8 @@ def _strip_all_our_blocks(file_path: Path) -> bool:
 
 
 def sync(cfg: Config) -> None:
-    if not os.environ.get("GH_TOKEN"):
-        print(
-            "sync requires GH_TOKEN. Set it to a GitHub PAT "
-            "(read-only public-repo access is enough).",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+    source = get_source()
+    source.ensure_ready()
 
     opts = cfg.tools.get("sync", {})
     templates = opts.get("templates", [])
@@ -655,8 +761,8 @@ def sync(cfg: Config) -> None:
         print("no [sync].templates defined in project.toml", file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"syncing {len(templates)} template(s): {', '.join(templates)}")
-    managed, write_once, append = _list_template_files(templates)
+    print(f"syncing {len(templates)} template(s) from {source.name}: {', '.join(templates)}")
+    managed, write_once, append = _list_template_files(templates, source)
     old_cfg_hash, old_managed, old_append = _read_sync_lock()
     new_cfg_hash = _cfg_hash(cfg)
     cfg_changed = new_cfg_hash != old_cfg_hash
@@ -673,7 +779,7 @@ def sync(cfg: Config) -> None:
         if not cfg_changed and old_managed.get(path) == sha and target.exists():
             skipped += 1
             continue
-        content = _substitute(_github_blob_bytes(sha), lookup)
+        content = _substitute(source.blob(sha), lookup)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         print(f"  wrote {path}  ({tname})")
@@ -684,7 +790,7 @@ def sync(cfg: Config) -> None:
         if target.exists():
             preserved += 1
             continue
-        content = _substitute(_github_blob_bytes(sha), lookup)
+        content = _substitute(source.blob(sha), lookup)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         print(f"  seeded {path}  ({tname})")
@@ -702,7 +808,7 @@ def sync(cfg: Config) -> None:
         target = ROOT / path
         blocks: dict[str, str] = {}
         for tname, sha in entries:
-            blob = _substitute(_github_blob_bytes(sha), lookup)
+            blob = _substitute(source.blob(sha), lookup)
             blocks[tname] = blob.decode("utf-8")
         if _merge_append_blocks(target, blocks):
             print(f"  merged {path}  ({', '.join(t for t, _ in entries)})")
@@ -737,20 +843,19 @@ def sync(cfg: Config) -> None:
 
 
 def self_update() -> None:
-    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{SELF_UPDATE_PATH}?ref=main"
+    source = get_source()
     try:
-        data = _github_fetch_json(url, context="self-update")
+        new_content = source.read(SELF_UPDATE_PATH)
     except SystemExit:
         print("Failed to check for updates.", file=sys.stderr)
         return
-    new_content = base64.b64decode(data["content"])
     script_path = Path(__file__).resolve()
     old_content = script_path.read_bytes()
     if new_content == old_content:
         print("Already up to date.")
         return
     script_path.write_bytes(new_content)
-    print(f"Updated {script_path}")
+    print(f"Updated {script_path} (from {source.name})")
 
 
 # --- CLI ---
