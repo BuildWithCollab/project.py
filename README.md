@@ -25,7 +25,7 @@ To pull the latest `project.py` later:
 python project.py self-update
 ```
 
-> `self-update` uses the GitHub Contents API. Set `GH_TOKEN` if you hit rate limits.
+> `self-update` uses the GitHub Contents API. Set `GH_TOKEN` if you hit rate limits — or set `PROJECT_PY_SOURCE` to update from a local checkout instead (see [Local source](#local-source--develop-without-pushing)).
 
 ---
 
@@ -296,7 +296,27 @@ Rules:
 
 Config changes propagate automatically: `.project-sync.lock` stores a hash of the relevant config sections, and sync re-renders all files whenever that hash changes — so renaming `project.name` and re-running `sync` actually updates references across every synced file.
 
-`sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately.
+`sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately. (Or set `PROJECT_PY_SOURCE` to sync from a local checkout without a token — see [Local source](#local-source--develop-without-pushing) below.)
+
+---
+
+## Local source — develop without pushing
+
+`self-update`, `sync`, and `init <preset>` normally read from this repo on GitHub. Set the `PROJECT_PY_SOURCE` environment variable to a **local checkout** of the `project.py` repo and they read straight from disk instead — no network, no `GH_TOKEN`.
+
+```bash
+PROJECT_PY_SOURCE=../project.py python project.py sync
+PROJECT_PY_SOURCE=../project.py python project.py self-update
+PROJECT_PY_SOURCE=../project.py python project.py init cpp
+```
+
+Use it when you're iterating on the templates, presets, or `project.py` itself and want to test the changes in a consumer repo *before* committing or pushing them.
+
+- **Per-invocation override.** Set the env var when you want local; leave it unset for normal GitHub behavior. Nothing in `project.toml` changes — it's not a committed setting.
+- **No token needed.** Because it never touches GitHub, `GH_TOKEN` isn't required while `PROJECT_PY_SOURCE` is set — including for `sync` and `init <preset>`, which otherwise demand it.
+- **All three commands honor it.** `self-update` copies the checkout's `project.py` over the one in your repo. `sync` reads `templates/`. `init <preset>` reads `presets/<name>.toml`, then chains its `sync` and `setup` against the local source exactly as the GitHub path does.
+
+The local source computes the **same git blob shas** GitHub serves — line endings normalized to LF, matching how git stores text — so `.project-sync.lock` stays source-agnostic. You can sync from local, push, then `sync` from GitHub on another machine with zero spurious re-downloads.
 
 ---
 
@@ -380,4 +400,4 @@ Rules:
 
 - **Don't include `[project]` in a preset** — `init` writes that section itself.
 - **Don't put `sync` inside `[commands]`** — sync is its own top-level command, and `init` auto-runs it once for you. Commands like `setup`/`build` are expected to run against the files sync already put in place.
-- `init <preset>` requires `GH_TOKEN` (it makes a GitHub API call). Plain `init` does not.
+- `init <preset>` requires `GH_TOKEN` (it makes a GitHub API call). Plain `init` does not. (Set `PROJECT_PY_SOURCE` to bootstrap from a local checkout without a token — see [Local source](#local-source--develop-without-pushing).)
