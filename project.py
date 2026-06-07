@@ -47,12 +47,18 @@ __version__ = "0.1.0"
 SELF_UPDATE_REPO = "BuildWithCollab/project.py"
 SELF_UPDATE_PATH = "project.py"
 
+# When [sources].repos is absent, templates (and presets / self-update) come from here.
+DEFAULT_REPOS = [SELF_UPDATE_REPO]
+
 TEMPLATES_REF = "main"
 TEMPLATES_DIR = "templates"
 WRITE_ONCE_DIR = "_write_once_"
 APPEND_DIR = "_append_"
 
-SOURCE_ENV = "PROJECT_PY_SOURCE"
+# An os.pathsep-separated list of LOCAL FOLDERS, searched ahead of the github repos —
+# like $PATH. A folder that provides templates/<name>/ shadows the same-named template
+# from a github repo, so you can iterate on templates locally without pushing.
+PATH_ENV = "PROJECT_PY_PATH"
 TOML_NAME = "project.toml"
 SYNC_LOCK_NAME = ".project-sync.lock"
 
@@ -409,9 +415,10 @@ def dispatch(spec: str, cfg: Config, *, root: Path, runner: Runner) -> None:
 
 
 # --- Source: where self-update / sync / presets read from ---
-# Default is GitHub. Set PROJECT_PY_SOURCE to a local checkout of this repo to read
-# everything from disk instead. The local source computes the *same* git blob shas
-# GitHub serves, so .project-sync.lock stays source-agnostic.
+# A Source is one place to read from — a github repo (GitHubSource) or a local folder
+# (LocalSource). SearchPathSource chains several in order. Local sources compute the
+# *same* git blob shas GitHub serves, so .project-sync.lock stays source-agnostic and a
+# PROJECT_PY_PATH checkout can transparently shadow a repo's template.
 
 class Source:
     name = "?"
@@ -433,16 +440,19 @@ class Source:
 
 
 class GitHubSource(Source):
-    name = "GitHub"
-
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(self, token: str | None = None, *, repo: str = SELF_UPDATE_REPO) -> None:
         self.token = token
+        self.repo = repo
+
+    @property
+    def name(self) -> str:
+        return f"github:{self.repo}"
 
     def ensure_ready(self) -> None:
         if not self.token:
             raise ProjectError(
                 "GitHub access requires GH_TOKEN. Set it to a GitHub PAT (read-only "
-                f"public-repo access is enough), or set {SOURCE_ENV} to a local checkout."
+                f"public-repo access is enough), or put a local checkout on {PATH_ENV}."
             )
 
     def _request(self, url: str) -> Request:
@@ -464,14 +474,14 @@ class GitHubSource(Source):
             raise ProjectError(f"GitHub API error ({e.code}): {ctx}")
 
     def read(self, path: str) -> bytes:
-        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{path}?ref={TEMPLATES_REF}"
+        url = f"https://api.github.com/repos/{self.repo}/contents/{path}?ref={TEMPLATES_REF}"
         data = self._fetch_json(url, context=path)
         if not isinstance(data, dict) or "content" not in data:
             raise ProjectError(f"unexpected response for {path}")
         return base64.b64decode(data["content"])
 
     def list_blobs(self) -> list[tuple[str, str]]:
-        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
+        url = f"https://api.github.com/repos/{self.repo}/git/trees/{TEMPLATES_REF}?recursive=1"
         data = self._fetch_json(url, context="template tree")
         if not isinstance(data, dict):
             raise ProjectError("unexpected tree response")
@@ -480,7 +490,7 @@ class GitHubSource(Source):
         return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
 
     def blob(self, sha: str) -> bytes:
-        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/blobs/{sha}"
+        url = f"https://api.github.com/repos/{self.repo}/git/blobs/{sha}"
         data = self._fetch_json(url, context=f"blob {sha[:8]}")
         if not isinstance(data, dict) or "content" not in data:
             raise ProjectError(f"unexpected blob response for {sha}")
@@ -522,15 +532,91 @@ class LocalSource(Source):
         return git_normalize(path.read_bytes())
 
 
-def get_source(env: dict | None = None) -> Source:
+class SearchPathSource(Source):
+    """Several sources searched in order, $PATH-style: the first to provide a template
+    owns it, shadowing every later source's same-named template.
+
+    Shadowing is keyed on the template name — the first path segment under templates/
+    (templates/<name>/...). A source "claims" <name> if it has any blob under it; once
+    claimed, later sources' blobs for that <name> are dropped. read()/blob() route to
+    the owning source. This is what lets a local checkout on PROJECT_PY_PATH override a
+    github repo's template without touching project.toml.
+    """
+
+    name = "search path"
+
+    def __init__(self, children: list[Source]) -> None:
+        self.children = list(children)
+        self._sha_to_child: dict[str, Source] = {}
+
+    def ensure_ready(self) -> None:
+        for child in self.children:
+            child.ensure_ready()
+
+    @staticmethod
+    def _template_name(path: str) -> str:
+        parts = path.split("/")
+        return parts[1] if len(parts) > 1 else path
+
+    def read(self, path: str) -> bytes:
+        last: ProjectError | None = None
+        for child in self.children:
+            try:
+                return child.read(path)
+            except ProjectError as e:
+                last = e
+        raise last or ProjectError(f"not found on search path: {path}")
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        self._sha_to_child = {}
+        claimed: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for child in self.children:
+            blobs = child.list_blobs()
+            owned = {self._template_name(p) for p, _ in blobs} - claimed
+            for path, sha in blobs:
+                if self._template_name(path) in owned:
+                    out.append((path, sha))
+                    self._sha_to_child.setdefault(sha, child)
+            claimed |= owned
+        return out
+
+    def blob(self, sha: str) -> bytes:
+        child = self._sha_to_child.get(sha)
+        if child is None:
+            raise ProjectError(f"no blob for sha {sha[:8]} (call list_blobs first)")
+        return child.blob(sha)
+
+
+def get_source(repos: list[str], env: dict | None = None) -> Source:
+    # Build the search path: local folders from PROJECT_PY_PATH first (so they shadow
+    # the remotes), then the github repos in declared order. A single source is returned
+    # bare; two or more are wrapped in a SearchPathSource.
     env = os.environ if env is None else env
-    local = env.get(SOURCE_ENV)
-    if not local:
-        return GitHubSource(env.get("GH_TOKEN"))
-    root = Path(local).expanduser().resolve()
-    if not root.is_dir():
-        raise ProjectError(f"{SOURCE_ENV}={local!r} is not a directory")
-    return LocalSource(root)
+    children: list[Source] = []
+    for entry in env.get(PATH_ENV, "").split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        root = Path(entry).expanduser().resolve()
+        if not root.is_dir():
+            raise ProjectError(f"{PATH_ENV} entry {entry!r} is not a directory")
+        children.append(LocalSource(root))
+    token = env.get("GH_TOKEN")
+    children.extend(GitHubSource(token, repo=repo) for repo in repos)
+    if not children:
+        raise ProjectError(f"no template sources: empty [sources].repos and no {PATH_ENV}")
+    return children[0] if len(children) == 1 else SearchPathSource(children)
+
+
+def repos_for(cfg: Config) -> list[str]:
+    """The github repos a project pulls templates from: [sources].repos, or DEFAULT_REPOS."""
+    raw = cfg.tools.get("sources", {}).get("repos")
+    if raw is None:
+        return list(DEFAULT_REPOS)
+    if isinstance(raw, str):
+        return [raw]
+    return list(raw)
 
 
 # --- pure: classify template files into managed / write-once / append ---
@@ -835,13 +921,25 @@ name = "{name}"
 # package_manager = "pnpm"
 
 # --- sync ---
-# `python project.py sync` pulls files from this repo's templates/<name>/
-# folders into your project. Names can be nested (e.g. "cpp/xmake").
-# Requires GH_TOKEN. Last template wins on file conflicts.
-# Writes .project-sync.lock — commit it so deletions propagate.
+# `python project.py sync` pulls files from templates/<name>/ folders into
+# your project. Names can be nested (e.g. "cpp/xmake"). Last template wins on
+# file conflicts. Writes .project-sync.lock — commit it so deletions propagate.
 #
 # [sync]
 # templates = ["python-base", "github-actions"]
+
+# --- sources ---
+# Where templates come from: an ordered list of github repos. Defaults to the
+# project.py repo if omitted. A template is resolved by searching the repos in
+# order; the first repo that has templates/<name>/ wins. Requires GH_TOKEN.
+#
+# [sources]
+# repos = ["BuildWithCollab/project.py", "you/your-templates"]
+#
+# For local iteration, set PROJECT_PY_PATH to one or more local folders
+# (os.pathsep-separated). They're searched AHEAD of the repos — like $PATH —
+# so a local templates/<name>/ shadows the same-named template from a repo.
+# Nothing local goes in project.toml; it stays portable.
 """
 
 
@@ -855,11 +953,12 @@ def init(root: Path, preset: str | None = None, *, source: Source | None = None,
         print(f"wrote {toml_path}")
         return
 
-    if source is None:
-        source = get_source()
-    source.ensure_ready()
+    # Presets live alongside templates, so the preset itself comes off the default
+    # search path. The synced templates, though, honor the preset's own [sources].repos.
+    preset_source = source or get_source(DEFAULT_REPOS)
+    preset_source.ensure_ready()
 
-    body = source.read(f"presets/{preset}.toml").decode("utf-8")
+    body = preset_source.read(f"presets/{preset}.toml").decode("utf-8")
     if not body.endswith("\n"):
         body += "\n"
     header = f'[project]\nname = "{root.name}"\n\n'
@@ -869,7 +968,7 @@ def init(root: Path, preset: str | None = None, *, source: Source | None = None,
     cfg = Config.load(toml_path)
     if cfg.tools.get("sync", {}).get("templates"):
         print("running sync...")
-        sync(cfg, root=root, source=source)
+        sync(cfg, root=root, source=source or get_source(repos_for(cfg)))
 
     setup_tasks = resolve_command("setup", cfg.commands, platform())
     if setup_tasks:
@@ -935,10 +1034,16 @@ File categories within each template folder:
   <name>/_write_once_/<rest>    scaffold (write only if absent)
   <name>/_append_/<rest>        block-merged into <rest>
 
+Templates are pulled from the github repos in [sources].repos (default:
+the project.py repo), searched in order — first repo with templates/<name>/
+wins. Set PROJECT_PY_PATH to local folder(s) to search them first, $PATH
+style, so a local checkout shadows a repo's template without editing
+project.toml.
+
 State is tracked in .project-sync.lock — commit it to git so
 deletions and append-block changes propagate across machines.
 
-Requires GH_TOKEN.""",
+Requires GH_TOKEN (unless every template resolves from PROJECT_PY_PATH).""",
     "self-update": """\
 usage: project.py self-update
 
@@ -981,13 +1086,15 @@ def main(
 
     try:
         if ns.command == "self-update":
-            src = source if source is not None else get_source(env)
+            # project.py itself isn't a template, so it rides the default search path:
+            # local checkout on PROJECT_PY_PATH if present, else the BuildWithCollab repo.
+            src = source if source is not None else get_source(DEFAULT_REPOS, env)
             self_update(script_path=script_path or Path(__file__).resolve(), source=src)
             return 0
 
         if ns.command == "init":
             preset = ns.args[0] if ns.args else None
-            src = (source if source is not None else get_source(env)) if preset else None
+            src = (source if source is not None else get_source(DEFAULT_REPOS, env)) if preset else None
             init(root, preset, source=src, runner=runner)
             return 0
 
@@ -995,7 +1102,7 @@ def main(
         cfg.args = ns.args
 
         if ns.command == "sync":
-            src = source if source is not None else get_source(env)
+            src = source if source is not None else get_source(repos_for(cfg), env)
             sync(cfg, root=root, source=src)
             return 0
 

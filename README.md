@@ -25,7 +25,7 @@ To pull the latest `project.py` later:
 python project.py self-update
 ```
 
-> `self-update` uses the GitHub Contents API. Set `GH_TOKEN` if you hit rate limits — or set `PROJECT_PY_SOURCE` to update from a local checkout instead (see [Local source](#local-source--develop-without-pushing)).
+> `self-update` uses the GitHub Contents API. Set `GH_TOKEN` if you hit rate limits — or put a local checkout on `PROJECT_PY_PATH` to update from disk instead (see [Local source](#local-source--develop-without-pushing)).
 
 ---
 
@@ -173,9 +173,9 @@ For anything beyond friendly single-shot subprocess (output parsing, parallelism
 
 ---
 
-## Syncing templates from GitHub
+## Syncing templates
 
-`sync` pulls files from the `templates/<name>/` folders in this repo into your project.
+`sync` pulls files from the `templates/<name>/` folders of one or more source repos into your project.
 
 ```toml
 [sync]
@@ -188,12 +188,30 @@ GH_TOKEN=ghp_xxx python project.py sync
 
 What it does:
 
-- Each named template is a folder under `templates/` in `BuildWithCollab/project.py`. Every file in that folder gets copied into your repo at the same relative path. So `templates/python-base/.gitignore` lands at `./.gitignore`; `templates/github-actions/.github/workflows/ci.yml` lands at `./.github/workflows/ci.yml`.
+- Each named template is a folder under `templates/` in a [source repo](#where-templates-come-from-sources). Every file in that folder gets copied into your repo at the same relative path. So `templates/python-base/.gitignore` lands at `./.gitignore`; `templates/github-actions/.github/workflows/ci.yml` lands at `./.github/workflows/ci.yml`.
 - Template names can be nested: `"cpp/xmake"` pulls everything under `templates/cpp/xmake/`. Organize templates into subfolders however you like.
 - Templates compose in order. If two templates ship the same file, the later one in the list wins. If you list overlapping prefixes like `["cpp", "cpp/xmake"]`, the most specific one claims its subtree.
 - Only files whose content actually changed get re-downloaded. `sync` lists the whole tree in one API call, compares each blob's git sha to `.project-sync.lock`, and skips anything unchanged.
 - Files that were in the previous sync but are no longer in any listed template get deleted.
 - `.project-sync.lock` is written at the repo root after each sync. **Commit it to git** so deletions propagate across machines and CI.
+
+### Where templates come from (`[sources]`)
+
+By default, templates are pulled from `BuildWithCollab/project.py`. Point `sync` at your own repos — **plural** — with `[sources].repos`:
+
+```toml
+[sources]
+repos = ["BuildWithCollab/project.py", "you/your-templates"]
+
+[sync]
+templates = ["cpp/xmake", "git", "your-custom-thing"]
+```
+
+The repos form an ordered **search path**, like `$PATH`. To resolve a template, `sync` looks through the repos in order and the **first one that has `templates/<name>/` wins** — so later repos extend the set, and an earlier repo can override a template a later one also ships. Within a single repo, the usual rules apply (list order for conflicts, longest-prefix for nested names).
+
+If `[sources]` is omitted, it's exactly `["BuildWithCollab/project.py"]` — so existing configs keep working unchanged.
+
+> The repo list is the **portable, committed** part. Local folders never go in `project.toml` — they're a per-machine override via `PROJECT_PY_PATH`, covered next.
 
 ### Write-once files (`_write_once_/`)
 
@@ -296,27 +314,31 @@ Rules:
 
 Config changes propagate automatically: `.project-sync.lock` stores a hash of the relevant config sections, and sync re-renders all files whenever that hash changes — so renaming `project.name` and re-running `sync` actually updates references across every synced file.
 
-`sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately. (Or set `PROJECT_PY_SOURCE` to sync from a local checkout without a token — see [Local source](#local-source--develop-without-pushing) below.)
+`sync` requires `GH_TOKEN` set to a GitHub PAT (read-only public-repo access is enough). Without it, you'd hit GitHub's 60 req/hour unauthenticated rate limit immediately. (Or put a local checkout on `PROJECT_PY_PATH` to sync from disk without a token — see [Local source](#local-source--develop-without-pushing) below.)
 
 ---
 
 ## Local source — develop without pushing
 
-`self-update`, `sync`, and `init <preset>` normally read from this repo on GitHub. Set the `PROJECT_PY_SOURCE` environment variable to a **local checkout** of the `project.py` repo and they read straight from disk instead — no network, no `GH_TOKEN`.
+`self-update`, `sync`, and `init <preset>` normally read from the github repos in [`[sources]`](#where-templates-come-from-sources). Set the `PROJECT_PY_PATH` environment variable to one or more **local folders** and they're searched *ahead* of those repos — like `$PATH` — so a local `templates/<name>/` shadows the same-named template from a repo, and they read straight from disk with no network and no `GH_TOKEN`.
 
 ```bash
-PROJECT_PY_SOURCE=../project.py python project.py sync
-PROJECT_PY_SOURCE=../project.py python project.py self-update
-PROJECT_PY_SOURCE=../project.py python project.py init cpp
+PROJECT_PY_PATH=../project.py python project.py sync
+PROJECT_PY_PATH=../project.py python project.py self-update
+PROJECT_PY_PATH=../project.py python project.py init cpp
+
+# multiple folders, os.pathsep-separated (':' on POSIX, ';' on Windows), searched in order:
+PROJECT_PY_PATH=../my-templates:../project.py python project.py sync
 ```
 
 Use it when you're iterating on the templates, presets, or `project.py` itself and want to test the changes in a consumer repo *before* committing or pushing them.
 
-- **Per-invocation override.** Set the env var when you want local; leave it unset for normal GitHub behavior. Nothing in `project.toml` changes — it's not a committed setting.
-- **No token needed.** Because it never touches GitHub, `GH_TOKEN` isn't required while `PROJECT_PY_SOURCE` is set — including for `sync` and `init <preset>`, which otherwise demand it.
-- **All three commands honor it.** `self-update` copies the checkout's `project.py` over the one in your repo. `sync` reads `templates/`. `init <preset>` reads `presets/<name>.toml`, then chains its `sync` and `setup` against the local source exactly as the GitHub path does.
+- **Per-machine override, never committed.** Set the env var when you want local; leave it unset for normal GitHub behavior. Nothing in `project.toml` changes — the repo list stays portable, the local paths live only in your shell.
+- **First match wins.** A template resolves to the first folder/repo on the path that provides it. Your local checkout is earlier than the repos, so it shadows them — exactly how a directory early in `$PATH` shadows a system binary.
+- **No token when everything resolves locally.** If every requested template is found on `PROJECT_PY_PATH`, GitHub is never contacted, so `GH_TOKEN` isn't required — including for `sync` and `init <preset>`, which otherwise demand it. (If a template *isn't* found locally and falls through to a github repo, that repo still needs a token.)
+- **All three commands honor it.** `self-update` copies a checkout's `project.py` over the one in your repo. `sync` reads `templates/`. `init <preset>` reads `presets/<name>.toml`, then chains its `sync` and `setup` against the same search path.
 
-The local source computes the **same git blob shas** GitHub serves — line endings normalized to LF, matching how git stores text — so `.project-sync.lock` stays source-agnostic. You can sync from local, push, then `sync` from GitHub on another machine with zero spurious re-downloads.
+Local folders compute the **same git blob shas** GitHub serves — line endings normalized to LF, matching how git stores text — so `.project-sync.lock` stays source-agnostic. You can sync from local, push, then `sync` from GitHub on another machine with zero spurious re-downloads.
 
 ---
 
@@ -400,4 +422,4 @@ Rules:
 
 - **Don't include `[project]` in a preset** — `init` writes that section itself.
 - **Don't put `sync` inside `[commands]`** — sync is its own top-level command, and `init` auto-runs it once for you. Commands like `setup`/`build` are expected to run against the files sync already put in place.
-- `init <preset>` requires `GH_TOKEN` (it makes a GitHub API call). Plain `init` does not. (Set `PROJECT_PY_SOURCE` to bootstrap from a local checkout without a token — see [Local source](#local-source--develop-without-pushing).)
+- `init <preset>` requires `GH_TOKEN` (it makes a GitHub API call). Plain `init` does not. (Put a local checkout on `PROJECT_PY_PATH` to bootstrap without a token — see [Local source](#local-source--develop-without-pushing).)
