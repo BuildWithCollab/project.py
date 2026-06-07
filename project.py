@@ -443,6 +443,21 @@ class Source:
         raise NotImplementedError
 
 
+_GH_API = "https://api.github.com"
+
+
+def gh_contents_url(repo: str, path: str, ref: str = TEMPLATES_REF) -> str:
+    return f"{_GH_API}/repos/{repo}/contents/{path}?ref={ref}"
+
+
+def gh_tree_url(repo: str, ref: str = TEMPLATES_REF) -> str:
+    return f"{_GH_API}/repos/{repo}/git/trees/{ref}?recursive=1"
+
+
+def gh_blob_url(repo: str, sha: str) -> str:
+    return f"{_GH_API}/repos/{repo}/git/blobs/{sha}"
+
+
 class GitHubSource(Source):
     def __init__(self, token: str | None = None, *, repo: str = SELF_UPDATE_REPO) -> None:
         self.token = token
@@ -478,15 +493,13 @@ class GitHubSource(Source):
             raise ProjectError(f"GitHub API error ({e.code}): {ctx}")
 
     def read(self, path: str) -> bytes:
-        url = f"https://api.github.com/repos/{self.repo}/contents/{path}?ref={TEMPLATES_REF}"
-        data = self._fetch_json(url, context=path)
+        data = self._fetch_json(gh_contents_url(self.repo, path), context=path)
         if not isinstance(data, dict) or "content" not in data:
             raise ProjectError(f"unexpected response for {path}")
         return base64.b64decode(data["content"])
 
     def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
-        url = f"https://api.github.com/repos/{self.repo}/git/trees/{TEMPLATES_REF}?recursive=1"
-        data = self._fetch_json(url, context="template tree")
+        data = self._fetch_json(gh_tree_url(self.repo), context="template tree")
         if not isinstance(data, dict):
             raise ProjectError("unexpected tree response")
         if data.get("truncated"):
@@ -494,8 +507,7 @@ class GitHubSource(Source):
         return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
 
     def blob(self, sha: str) -> bytes:
-        url = f"https://api.github.com/repos/{self.repo}/git/blobs/{sha}"
-        data = self._fetch_json(url, context=f"blob {sha[:8]}")
+        data = self._fetch_json(gh_blob_url(self.repo, sha), context=f"blob {sha[:8]}")
         if not isinstance(data, dict) or "content" not in data:
             raise ProjectError(f"unexpected blob response for {sha}")
         return base64.b64decode(data["content"])

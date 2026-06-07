@@ -8,6 +8,9 @@ from project import (
     ProjectError,
     SearchPathSource,
     get_source,
+    gh_blob_url,
+    gh_contents_url,
+    gh_tree_url,
     git_blob_sha,
     repos_for,
 )
@@ -55,6 +58,30 @@ class TestLocalSource:
 
     def test_no_templates_dir_is_empty(self, tmp_path):
         assert_that(LocalSource(tmp_path).list_blobs()).is_equal_to([])
+
+
+class TestGitHubUrls:
+    # The only multi-repo-specific thing on the github path: the repo arg must land in
+    # the URL. (The HTTP round-trip itself is network-only and identical for any repo.)
+    def test_contents_url_uses_repo(self):
+        assert_that(gh_contents_url("you/your-templates", "presets/cpp.toml")).is_equal_to(
+            "https://api.github.com/repos/you/your-templates/contents/presets/cpp.toml?ref=main"
+        )
+
+    def test_tree_url_uses_repo(self):
+        assert_that(gh_tree_url("you/your-templates")).is_equal_to(
+            "https://api.github.com/repos/you/your-templates/git/trees/main?recursive=1"
+        )
+
+    def test_blob_url_uses_repo(self):
+        assert_that(gh_blob_url("you/your-templates", "deadbeef")).is_equal_to(
+            "https://api.github.com/repos/you/your-templates/git/blobs/deadbeef"
+        )
+
+    def test_two_sources_build_distinct_urls(self):
+        a, b = GitHubSource(repo="org/a"), GitHubSource(repo="org/b")
+        assert_that(gh_tree_url(a.repo)).does_not_contain("org/b")
+        assert_that(gh_tree_url(b.repo)).does_not_contain("org/a")
 
 
 class TestGetSource:
