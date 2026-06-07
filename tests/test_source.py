@@ -103,16 +103,15 @@ class TestSearchPathSource:
         a = DictSource({"templates/cpp/x.lua": b"from-a\n"})
         b = DictSource({"templates/cpp/x.lua": b"from-b\n"})
         sp = SearchPathSource([a, b])
-        blobs = sp.list_blobs()
+        blobs = sp.list_blobs(["cpp"])
         assert_that([p for p, _ in blobs]).is_equal_to(["templates/cpp/x.lua"])
-        sha = blobs[0][1]
-        assert_that(sp.blob(sha)).is_equal_to(b"from-a\n")
+        assert_that(sp.blob(blobs[0][1])).is_equal_to(b"from-a\n")
 
     def test_distinct_templates_merge(self):
         a = DictSource({"templates/cpp/x.lua": b"a\n"})
         b = DictSource({"templates/git/.gitignore": b"build/\n"})
         sp = SearchPathSource([a, b])
-        paths = sorted(p for p, _ in sp.list_blobs())
+        paths = sorted(p for p, _ in sp.list_blobs(["cpp", "git"]))
         assert_that(paths).is_equal_to(["templates/cpp/x.lua", "templates/git/.gitignore"])
 
     def test_later_source_fills_gap(self):
@@ -120,17 +119,36 @@ class TestSearchPathSource:
         a = DictSource({"templates/git/.gitignore": b"x\n"})
         b = DictSource({"templates/cpp/x.lua": b"y\n"})
         sp = SearchPathSource([a, b])
-        cpp = [(p, s) for p, s in sp.list_blobs() if p == "templates/cpp/x.lua"]
+        cpp = [(p, s) for p, s in sp.list_blobs(["cpp", "git"]) if p == "templates/cpp/x.lua"]
         assert_that(cpp).is_length(1)
         assert_that(sp.blob(cpp[0][1])).is_equal_to(b"y\n")
 
-    def test_shadowing_is_whole_template_not_per_file(self):
-        # First source owns "cpp" via one file; second source's EXTRA cpp file is dropped.
-        a = DictSource({"templates/cpp/a.lua": b"a\n"})
-        b = DictSource({"templates/cpp/a.lua": b"b\n", "templates/cpp/b.lua": b"extra\n"})
+    def test_nested_siblings_dont_collide_across_sources(self):
+        # cpp/base from A and cpp/xmake from B must BOTH survive — they're different
+        # templates that merely share a top-level dir. (The old top-dir keying broke this.)
+        a = DictSource({"templates/cpp/base/a.lua": b"base\n"})
+        b = DictSource({"templates/cpp/xmake/x.lua": b"xmake\n"})
         sp = SearchPathSource([a, b])
-        paths = sorted(p for p, _ in sp.list_blobs())
-        assert_that(paths).is_equal_to(["templates/cpp/a.lua"])
+        paths = sorted(p for p, _ in sp.list_blobs(["cpp/base", "cpp/xmake"]))
+        assert_that(paths).is_equal_to(
+            ["templates/cpp/base/a.lua", "templates/cpp/xmake/x.lua"]
+        )
+
+    def test_unneeded_unready_child_is_never_consulted(self):
+        # The whole point: local covers every wanted template, so the not-ready github
+        # stand-in is never touched and never demands a token.
+        local = DictSource({"templates/cpp/x.lua": b"local\n"})
+        github = DictSource({"templates/cpp/x.lua": b"remote\n"}, ready=False)
+        sp = SearchPathSource([local, github])
+        blobs = sp.list_blobs(["cpp"])  # does not raise
+        assert_that(sp.blob(blobs[0][1])).is_equal_to(b"local\n")
+
+    def test_needed_unready_child_still_raises(self):
+        # cpp is only in the not-ready source -> we must reach it, so it raises.
+        local = DictSource({"templates/git/.gitignore": b"x\n"})
+        github = DictSource({"templates/cpp/x.lua": b"y\n"}, ready=False)
+        sp = SearchPathSource([local, github])
+        assert_that(sp.list_blobs).raises(ProjectError).when_called_with(["cpp"])
 
     def test_read_falls_through(self):
         a = DictSource({"presets/cpp.toml": b"[a]\n"})
@@ -142,9 +160,11 @@ class TestSearchPathSource:
         sp = SearchPathSource([DictSource({}), DictSource({})])
         assert_that(sp.read).raises(ProjectError).when_called_with("nope.toml")
 
-    def test_ensure_ready_checks_all_children(self):
+    def test_ensure_ready_is_lazy_noop(self):
+        # ensure_ready no longer eagerly checks children — readiness is enforced only
+        # when list_blobs actually reaches a child.
         sp = SearchPathSource([DictSource({}, ready=True), DictSource({}, ready=False)])
-        assert_that(sp.ensure_ready).raises(ProjectError).when_called_with()
+        sp.ensure_ready()  # does not raise
 
 
 class TestGitHubSourceReady:

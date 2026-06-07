@@ -38,7 +38,7 @@ class DictSource(Source):
             raise ProjectError(f"not found in dict source: {path}")
         return git_normalize(self.files[path])
 
-    def list_blobs(self):
+    def list_blobs(self, wanted=None):
         self._by_sha = {}
         out = []
         prefix = f"{TEMPLATES_DIR}/"

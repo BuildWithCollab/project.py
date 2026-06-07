@@ -430,8 +430,12 @@ class Source:
         """Read a single repo-relative file's bytes."""
         raise NotImplementedError
 
-    def list_blobs(self) -> list[tuple[str, str]]:
-        """Every blob under templates/, as (repo-relative posix path, git sha)."""
+    def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
+        """Every blob under templates/, as (repo-relative posix path, git sha).
+
+        `wanted` (template names sync actually asked for) is a hint a composite source
+        uses to skip sources it doesn't need; single sources may ignore it and list all.
+        """
         raise NotImplementedError
 
     def blob(self, sha: str) -> bytes:
@@ -480,7 +484,7 @@ class GitHubSource(Source):
             raise ProjectError(f"unexpected response for {path}")
         return base64.b64decode(data["content"])
 
-    def list_blobs(self) -> list[tuple[str, str]]:
+    def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
         url = f"https://api.github.com/repos/{self.repo}/git/trees/{TEMPLATES_REF}?recursive=1"
         data = self._fetch_json(url, context="template tree")
         if not isinstance(data, dict):
@@ -510,7 +514,7 @@ class LocalSource(Source):
             raise ProjectError(f"not found in local source {self.root}: {path}")
         return git_normalize(target.read_bytes())
 
-    def list_blobs(self) -> list[tuple[str, str]]:
+    def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
         self._sha_to_path = {}
         blobs: list[tuple[str, str]] = []
         base = self.root / TEMPLATES_DIR
@@ -550,13 +554,28 @@ class SearchPathSource(Source):
         self._sha_to_child: dict[str, Source] = {}
 
     def ensure_ready(self) -> None:
-        for child in self.children:
-            child.ensure_ready()
+        # Deliberately lazy: a child's readiness is checked only if list_blobs/read
+        # actually reaches it. That's what lets a local PROJECT_PY_PATH that covers every
+        # wanted template avoid ever consulting (and demanding a token for) a github repo.
+        pass
 
     @staticmethod
-    def _template_name(path: str) -> str:
-        parts = path.split("/")
-        return parts[1] if len(parts) > 1 else path
+    def _provides(blobs: list[tuple[str, str]], template: str) -> list[tuple[str, str]]:
+        prefix = f"{TEMPLATES_DIR}/{template}/"
+        return [(p, s) for p, s in blobs if p.startswith(prefix)]
+
+    @staticmethod
+    def _top_level(blobs: list[tuple[str, str]]) -> set[str]:
+        names = set()
+        for path, _ in blobs:
+            parts = path.split("/")
+            if len(parts) > 1:
+                names.add(parts[1])
+        return names
+
+    def _consult(self, child: Source) -> list[tuple[str, str]]:
+        child.ensure_ready()
+        return child.list_blobs()
 
     def read(self, path: str) -> bytes:
         last: ProjectError | None = None
@@ -567,18 +586,46 @@ class SearchPathSource(Source):
                 last = e
         raise last or ProjectError(f"not found on search path: {path}")
 
-    def list_blobs(self) -> list[tuple[str, str]]:
+    def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
+        # Walk children in order; the first child that provides a given template owns it
+        # (every file under templates/<template>/). Ownership is keyed on the requested
+        # template name, so "cpp/base" and "cpp/xmake" from different repos don't collide.
+        # Once every wanted template is claimed we stop — later children are never touched.
         self._sha_to_child = {}
-        claimed: set[str] = set()
         out: list[tuple[str, str]] = []
-        for child in self.children:
-            blobs = child.list_blobs()
-            owned = {self._template_name(p) for p, _ in blobs} - claimed
+        seen_paths: set[str] = set()
+
+        def take(child: Source, blobs: list[tuple[str, str]]) -> None:
             for path, sha in blobs:
-                if self._template_name(path) in owned:
-                    out.append((path, sha))
-                    self._sha_to_child.setdefault(sha, child)
-            claimed |= owned
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                out.append((path, sha))
+                self._sha_to_child.setdefault(sha, child)
+
+        if wanted is None:
+            # No hint: own by top-level template dir, first child wins, consult everyone.
+            claimed: set[str] = set()
+            for child in self.children:
+                blobs = self._consult(child)
+                for name in self._top_level(blobs) - claimed:
+                    take(child, self._provides(blobs, name))
+                    claimed.add(name)
+            return out
+
+        remaining = list(dict.fromkeys(wanted))  # de-dup, keep order
+        for child in self.children:
+            if not remaining:
+                break
+            blobs = self._consult(child)
+            still: list[str] = []
+            for template in remaining:
+                provided = self._provides(blobs, template)
+                if provided:
+                    take(child, provided)
+                else:
+                    still.append(template)
+            remaining = still
         return out
 
     def blob(self, sha: str) -> bytes:
@@ -797,7 +844,7 @@ def sync(cfg: Config, *, root: Path, source: Source) -> None:
         raise ProjectError("no [sync].templates defined in project.toml")
 
     print(f"syncing {len(templates)} template(s) from {source.name}: {', '.join(templates)}")
-    files = classify_template_files(source.list_blobs(), templates)
+    files = classify_template_files(source.list_blobs(templates), templates)
     for w in files.warnings:
         print(w, file=sys.stderr)
 

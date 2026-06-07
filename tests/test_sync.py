@@ -1,6 +1,6 @@
 from assertpy import assert_that
 
-from project import Config, ProjectError, parse_lock, sync
+from project import Config, ProjectError, SearchPathSource, parse_lock, sync
 from tests._fakes import DictSource
 
 
@@ -100,6 +100,23 @@ class TestSyncAppend:
         text = (tmp_path / ".gitignore").read_text()
         assert_that(text).contains("mine.txt")
         assert_that(text).does_not_contain("START")
+
+
+class TestSyncSearchPath:
+    def test_local_covers_everything_skips_unready_remote(self, tmp_path):
+        # local provides every wanted template -> the not-ready "github" source is never
+        # consulted, so sync completes without a GH_TOKEN error.
+        local = DictSource({"templates/git/.gitattributes": b"* text=auto\n"})
+        remote = DictSource({"templates/git/.gitattributes": b"remote\n"}, ready=False)
+        sync(cfg_with(["git"]), root=tmp_path, source=SearchPathSource([local, remote]))
+        assert_that((tmp_path / ".gitattributes").read_bytes()).is_equal_to(b"* text=auto\n")
+
+    def test_falls_through_to_second_source(self, tmp_path):
+        a = DictSource({"templates/git/.gitattributes": b"a\n"})
+        b = DictSource({"templates/cpp/x.lua": b"y\n"})
+        sync(cfg_with(["git", "cpp"]), root=tmp_path, source=SearchPathSource([a, b]))
+        assert_that((tmp_path / ".gitattributes").read_text()).is_equal_to("a\n")
+        assert_that((tmp_path / "x.lua").read_text()).is_equal_to("y\n")
 
 
 class TestSyncErrors:
