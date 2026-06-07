@@ -5,3 +5,4 @@ __pycache__/
 # This repo hosts the runner; it does not consume it.
 project.toml
 .project-sync.lock
+.project-sync-cache.json

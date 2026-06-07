@@ -61,6 +61,10 @@ APPEND_DIR = "_append_"
 PATH_ENV = "PROJECT_PY_PATH"
 TOML_NAME = "project.toml"
 SYNC_LOCK_NAME = ".project-sync.lock"
+# Per-machine cache of each github repo's template tree, keyed by ETag. Lets `sync`
+# send If-None-Match and take a free 304 instead of re-listing an unchanged tree.
+# NOT committed (unlike the lock) — it's a network cache, gitignore it.
+SYNC_CACHE_NAME = ".project-sync-cache.json"
 
 
 class ProjectError(Exception):
@@ -458,10 +462,78 @@ def gh_blob_url(repo: str, sha: str) -> str:
     return f"{_GH_API}/repos/{repo}/git/blobs/{sha}"
 
 
+# --- pure: tree parse + the conditional-fetch decision (testable without network) ---
+
+def parse_tree(data: dict) -> list[tuple[str, str]]:
+    """Pull the blob entries out of a git/trees response as (path, sha)."""
+    return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
+
+
+def resolve_tree(
+    status: int,
+    etag: str | None,
+    data: dict | None,
+    cached_blobs: list[tuple[str, str]] | None,
+) -> tuple[list[tuple[str, str]], tuple[str | None, list[tuple[str, str]]] | None]:
+    """Decide what a conditional tree fetch yields.
+
+    Returns (blobs, cache_entry). On 304 we reuse the cached blobs and write nothing
+    (cache_entry is None); on 200 we parse the fresh tree and hand back (etag, blobs)
+    to store. Pure — the network call is the caller's problem.
+    """
+    if status == 304:
+        return (cached_blobs or []), None
+    blobs = parse_tree(data or {})
+    return blobs, (etag, blobs)
+
+
+class TreeCache:
+    """Per-repo template-tree cache on disk, keyed by ETag. Per-machine, not committed.
+
+    A corrupt or missing file is treated as empty — a cache miss must never break sync.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._data: dict | None = None
+
+    def _load(self) -> None:
+        if self._data is not None:
+            return
+        try:
+            self._data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._data = {}
+
+    def get(self, repo: str) -> tuple[str | None, list[tuple[str, str]] | None]:
+        self._load()
+        entry = self._data.get(repo) if isinstance(self._data, dict) else None
+        if not entry:
+            return None, None
+        return entry.get("etag"), [tuple(b) for b in entry.get("blobs", [])]
+
+    def put(self, repo: str, etag: str | None, blobs: list[tuple[str, str]]) -> None:
+        self._load()
+        self._data[repo] = {"etag": etag, "blobs": [list(b) for b in blobs]}
+        try:
+            self.path.write_text(
+                json.dumps(self._data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError as e:
+            print(f"warning: could not write tree cache {self.path}: {e}", file=sys.stderr)
+
+
 class GitHubSource(Source):
-    def __init__(self, token: str | None = None, *, repo: str = SELF_UPDATE_REPO) -> None:
+    def __init__(
+        self,
+        token: str | None = None,
+        *,
+        repo: str = SELF_UPDATE_REPO,
+        cache: TreeCache | None = None,
+    ) -> None:
         self.token = token
         self.repo = repo
+        self.cache = cache
 
     @property
     def name(self) -> str:
@@ -492,6 +564,26 @@ class GitHubSource(Source):
                 raise ProjectError(f"Access denied: {ctx} (set GH_TOKEN to authenticate)")
             raise ProjectError(f"GitHub API error ({e.code}): {ctx}")
 
+    def _conditional_get(self, url: str, etag: str | None = None, context: str = "") -> tuple[int, str | None, dict | list | None]:
+        # Like _fetch_json, but sends If-None-Match and surfaces a 304 instead of raising.
+        # Returns (status, response ETag, parsed JSON | None-on-304).
+        req = self._request(url)
+        if etag:
+            req.add_header("If-None-Match", etag)
+        try:
+            with urlopen(req, timeout=10) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                return status, response.headers.get("ETag"), json.load(response)
+        except HTTPError as e:
+            if e.code == 304:
+                return 304, etag, None
+            ctx = context or url
+            if e.code == 404:
+                raise ProjectError(f"Not found: {ctx}")
+            if e.code == 403:
+                raise ProjectError(f"Access denied: {ctx} (set GH_TOKEN to authenticate)")
+            raise ProjectError(f"GitHub API error ({e.code}): {ctx}")
+
     def read(self, path: str) -> bytes:
         data = self._fetch_json(gh_contents_url(self.repo, path), context=path)
         if not isinstance(data, dict) or "content" not in data:
@@ -499,12 +591,21 @@ class GitHubSource(Source):
         return base64.b64decode(data["content"])
 
     def list_blobs(self, wanted: list[str] | None = None) -> list[tuple[str, str]]:
-        data = self._fetch_json(gh_tree_url(self.repo), context="template tree")
-        if not isinstance(data, dict):
-            raise ProjectError("unexpected tree response")
-        if data.get("truncated"):
-            print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
-        return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
+        # Conditional on the cached ETag: an unchanged tree comes back 304 (free, no body,
+        # no rate-limit cost) and we reuse the cached blob list instead of re-listing.
+        etag, cached = self.cache.get(self.repo) if self.cache else (None, None)
+        status, new_etag, data = self._conditional_get(
+            gh_tree_url(self.repo), etag, context="template tree"
+        )
+        if status != 304:
+            if not isinstance(data, dict):
+                raise ProjectError("unexpected tree response")
+            if data.get("truncated"):
+                print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
+        blobs, entry = resolve_tree(status, new_etag, data if isinstance(data, dict) else None, cached)
+        if entry is not None and self.cache is not None:
+            self.cache.put(self.repo, entry[0], entry[1])
+        return blobs
 
     def blob(self, sha: str) -> bytes:
         data = self._fetch_json(gh_blob_url(self.repo, sha), context=f"blob {sha[:8]}")
@@ -647,10 +748,11 @@ class SearchPathSource(Source):
         return child.blob(sha)
 
 
-def get_source(repos: list[str], env: dict | None = None) -> Source:
+def get_source(repos: list[str], env: dict | None = None, *, cache: TreeCache | None = None) -> Source:
     # Build the search path: local folders from PROJECT_PY_PATH first (so they shadow
     # the remotes), then the github repos in declared order. A single source is returned
-    # bare; two or more are wrapped in a SearchPathSource.
+    # bare; two or more are wrapped in a SearchPathSource. The tree cache, if given, is
+    # shared by every github repo (it keys entries by repo, so one file covers them all).
     env = os.environ if env is None else env
     children: list[Source] = []
     for entry in env.get(PATH_ENV, "").split(os.pathsep):
@@ -662,7 +764,7 @@ def get_source(repos: list[str], env: dict | None = None) -> Source:
             raise ProjectError(f"{PATH_ENV} entry {entry!r} is not a directory")
         children.append(LocalSource(root))
     token = env.get("GH_TOKEN")
-    children.extend(GitHubSource(token, repo=repo) for repo in repos)
+    children.extend(GitHubSource(token, repo=repo, cache=cache) for repo in repos)
     if not children:
         raise ProjectError(f"no template sources: empty [sources].repos and no {PATH_ENV}")
     return children[0] if len(children) == 1 else SearchPathSource(children)
@@ -1036,7 +1138,10 @@ def init(
     cfg = Config.load(toml_path)
     if cfg.tools.get("sync", {}).get("templates"):
         print("running sync...")
-        sync(cfg, root=root, source=source or get_source(repos_for(cfg), env))
+        sync_source = source or get_source(
+            repos_for(cfg), env, cache=TreeCache(root / SYNC_CACHE_NAME)
+        )
+        sync(cfg, root=root, source=sync_source)
 
     setup_tasks = resolve_command("setup", cfg.commands, platform())
     if setup_tasks:
@@ -1171,7 +1276,9 @@ def main(
         cfg.args = ns.args
 
         if ns.command == "sync":
-            src = source if source is not None else get_source(repos_for(cfg), env)
+            src = source if source is not None else get_source(
+                repos_for(cfg), env, cache=TreeCache(root / SYNC_CACHE_NAME)
+            )
             sync(cfg, root=root, source=src)
             return 0
 
