@@ -101,6 +101,21 @@ class TestListBlobsCaching:
         assert_that(src.sent_etags).is_equal_to([None, 'W/"e1"'])  # 2nd sent the cached tag
         assert_that(second).is_equal_to(first)  # 304 -> identical blobs, from cache
 
+    def test_stale_etag_gets_200_and_refreshes_cache(self, tmp_path):
+        # Repo changed since last sync: we send the stale etag, GitHub answers 200 with a
+        # new etag + tree, and the cache is overwritten. (Live this is masked by GitHub's
+        # ~60s anonymous edge cache; here it's deterministic.)
+        cache = TreeCache(tmp_path / "c.json")
+        cache.put("org/a", 'W/"old"', [("templates/old/x", "sold")])
+        fresh = {"tree": [{"path": "templates/new/y", "sha": "snew", "type": "blob"}]}
+        src = _CannedGitHub([(200, 'W/"new"', fresh)], repo="org/a", cache=cache)
+        blobs = src.list_blobs(["new"])
+        assert_that(src.sent_etags).is_equal_to(['W/"old"'])  # sent the stale tag
+        assert_that(blobs).is_equal_to([("templates/new/y", "snew")])  # fresh blobs
+        reloaded = TreeCache(tmp_path / "c.json").get("org/a")
+        assert_that(reloaded[0]).is_equal_to('W/"new"')  # cache overwritten
+        assert_that(reloaded[1]).is_equal_to([("templates/new/y", "snew")])
+
     def test_no_cache_means_no_etag_ever_sent(self, tmp_path):
         # Without a cache (e.g. tests injecting sources), behavior is the old unconditional
         # listing: no If-None-Match, no persistence.
