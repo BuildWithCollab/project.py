@@ -12,6 +12,16 @@
 # Notes:
 #   - Python 3.11+, standard library only.
 #   - Single file. Drop into any repo, pair with project.toml.
+#
+# Design:
+#   The decision logic (template bucketing, append-block merge, lock parse/format,
+#   {{var}} substitution, git blob sha, command resolution, clang-tidy diagnostic
+#   parsing) is a set of PURE functions — data in, data out — tested by direct call.
+#   The effectful shell (sync / init / self_update / dispatch) takes its dependencies
+#   as explicit arguments: a `root` Path, a `Source`, and a `Runner`. Tests pass a
+#   real tmp dir + an in-memory `Source` subclass + a recording `Runner`. No globals
+#   are read by the logic and nothing is monkeypatched. `main()` is the only place
+#   that wires the production defaults and turns a `ProjectError` into an exit code.
 from __future__ import annotations
 
 import argparse
@@ -28,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -42,9 +52,17 @@ TEMPLATES_DIR = "templates"
 WRITE_ONCE_DIR = "_write_once_"
 APPEND_DIR = "_append_"
 
-ROOT: Path = Path(__file__).resolve().parent
-TOML_PATH: Path = ROOT / "project.toml"
-SYNC_LOCK_PATH: Path = ROOT / ".project-sync.lock"
+SOURCE_ENV = "PROJECT_PY_SOURCE"
+TOML_NAME = "project.toml"
+SYNC_LOCK_NAME = ".project-sync.lock"
+
+
+class ProjectError(Exception):
+    """A user-facing error. Raised by core logic, formatted + exited at the CLI edge."""
+
+    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 # --- Platform ---
@@ -63,6 +81,13 @@ def platform() -> Platform:
     return Platform.LINUX
 
 
+_PLATFORM_SUFFIX = {
+    Platform.WINDOWS: "windows",
+    Platform.MAC: "macos",
+    Platform.LINUX: "linux",
+}
+
+
 # --- Config ---
 
 @dataclass
@@ -73,7 +98,7 @@ class Config:
     args: list[str] = field(default_factory=list)
 
     @classmethod
-    def load(cls, path: Path = TOML_PATH) -> "Config":
+    def load(cls, path: Path) -> "Config":
         if not path.exists():
             return cls()
         with path.open("rb") as f:
@@ -85,26 +110,166 @@ class Config:
         )
 
 
-# --- subprocess helpers ---
+# --- subprocess: a public helper for consumer scripts, plus an injectable Runner ---
+
+def _echo_run(cmd: list[str] | str, *, check: bool = True, shell: bool = False, **kw: Any) -> subprocess.CompletedProcess:
+    pretty = cmd if isinstance(cmd, str) else " ".join(str(a) for a in cmd)
+    print(f"$ {pretty}", flush=True)
+    return subprocess.run(cmd, check=check, shell=shell, **kw)
+
 
 def run(cmd: list[str] | str, *, check: bool = True, **kw: Any) -> subprocess.CompletedProcess:
-    pretty = cmd if isinstance(cmd, str) else " ".join(cmd)
-    print(f"$ {pretty}", flush=True)
-    return subprocess.run(cmd, check=check, **kw)
+    """Friendly one-shot subprocess for consumer scripts: echoes the command, then runs it."""
+    return _echo_run(cmd, check=check, **kw)
 
 
 def xmake(*args: str, **kw: Any) -> subprocess.CompletedProcess:
     return run(["xmake", *args], **kw)
 
 
-# --- clang-tidy (two-pass: parallel discovery, serial fix) ---
+class Runner:
+    """The subprocess seam used by built-in tasks and command dispatch.
+
+    Real implementation echoes + shells out. Tests pass a recording stand-in so
+    dispatch and the built-in tasks are exercisable without spawning processes.
+    """
+
+    def run(self, cmd: list[str] | str, *, shell: bool = False, check: bool = True,
+            capture: bool = False) -> subprocess.CompletedProcess:
+        if capture:
+            return _echo_run(cmd, shell=shell, check=check,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return _echo_run(cmd, shell=shell, check=check)
+
+
+# --- pure: variable substitution ({{section.key}}) ---
+
+_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*)\s*\}\}")
+
+
+def scalar(v: Any) -> str | None:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (str, int, float)):
+        return str(v)
+    return None
+
+
+def build_var_lookup(cfg: Config) -> dict[str, str]:
+    flat: dict[str, str] = {}
+    for k, v in cfg.project.items():
+        s = scalar(v)
+        if s is not None:
+            flat[f"project.{k}"] = s
+    for section, body in cfg.tools.items():
+        if not isinstance(body, dict):
+            continue
+        for k, v in body.items():
+            s = scalar(v)
+            if s is not None:
+                flat[f"{section}.{k}"] = s
+    return flat
+
+
+def substitute(content: bytes, lookup: dict[str, str]) -> bytes:
+    if not lookup:
+        return content
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    new_text = _VAR_RE.sub(lambda m: lookup.get(m.group(1), m.group(0)), text)
+    if new_text == text:
+        return content
+    return new_text.encode("utf-8")
+
+
+def cfg_hash(cfg: Config) -> str:
+    payload = json.dumps({"project": cfg.project, "tools": cfg.tools}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# --- pure: git blob sha (so local + GitHub sources agree on content identity) ---
+
+def git_normalize(data: bytes) -> bytes:
+    # Mirror git's default text handling so local shas match what GitHub serves:
+    # text blobs are stored LF-normalized; a file with a NUL byte is treated as
+    # binary and passed through untouched (git's own text/binary heuristic).
+    if b"\x00" in data:
+        return data
+    return data.replace(b"\r\n", b"\n")
+
+
+def git_blob_sha(data: bytes) -> str:
+    # sha1 of "blob <len>\0" + content, matching `git hash-object` on LF-normalized bytes.
+    h = hashlib.sha1()
+    h.update(b"blob " + str(len(data)).encode() + b"\x00")
+    h.update(data)
+    return h.hexdigest()
+
+
+# --- pure: command resolution ---
+
+def resolve_command(name: str, commands: dict[str, list[str]], plat: Platform) -> list[str]:
+    # Platform-specific overrides win: `name:windows` / `name:macos` / `name:linux`,
+    # falling back to the plain `name`.
+    plat_key = f"{name}:{_PLATFORM_SUFFIX[plat]}"
+    if plat_key in commands:
+        return list(commands[plat_key])
+    return list(commands.get(name, []))
+
+
+def classify_spec(spec: str) -> tuple[str, Any]:
+    """Pure routing decision for a task reference.
+
+    Returns ("shell", cmd) / ("module", (module_path, attr)) / ("builtin", name).
+    """
+    if spec.startswith("$"):
+        cmd = spec[1:].lstrip()
+        if not cmd:
+            raise ProjectError(f"empty shell command: {spec!r}")
+        return ("shell", cmd)
+    if ":" in spec:
+        head, _, attr = spec.partition(":")
+        if not attr:
+            raise ProjectError(f"expected 'module:attr', got {spec!r}")
+        return ("module", (head, attr))
+    return ("builtin", spec)
+
+
+# --- clang-tidy: pure selection/parsing + an effectful two-pass orchestrator ---
 
 _DIAG = re.compile(r"^(?P<path>[^:]+):\d+:\d+:\s+(warning|error):\s")
 CLANG_TIDY_EXTS = {".cppm", ".cpp", ".cc", ".cxx"}
 
 
+def select_translation_units(db: list[dict], root: Path, extensions: set[str]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for entry in db:
+        p = Path(entry["file"]).resolve()
+        if p.suffix not in extensions or not p.is_relative_to(root) or p in seen:
+            continue
+        seen.add(p)
+        files.append(p)
+    return files
+
+
+def parse_diagnostics(output: str, root: Path) -> set[Path]:
+    offenders: set[Path] = set()
+    for line in output.splitlines():
+        m = _DIAG.match(line)
+        if not m:
+            continue
+        offender = Path(m.group("path")).resolve()
+        if offender.is_relative_to(root):
+            offenders.add(offender)
+    return offenders
+
+
 def clang_tidy_check_and_fix(
     *,
+    runner: Runner,
     binary: str = "clang-tidy",
     compile_commands: Path = Path("compile_commands.json"),
     root: Path | None = None,
@@ -116,16 +281,11 @@ def clang_tidy_check_and_fix(
     root = (root or Path.cwd()).resolve()
     jobs = jobs or os.cpu_count() or 1
 
-    db = json.loads(compile_commands.read_text(encoding="utf-8"))
-    files: list[Path] = []
-    seen: set[Path] = set()
-    for entry in db:
-        p = Path(entry["file"]).resolve()
-        if p.suffix not in extensions or not p.is_relative_to(root) or p in seen:
-            continue
-        seen.add(p)
-        files.append(p)
+    if not compile_commands.is_file():
+        raise ProjectError(f"{compile_commands} not found (run a build/config first to generate it)")
 
+    db = json.loads(compile_commands.read_text(encoding="utf-8"))
+    files = select_translation_units(db, root, extensions)
     if not files:
         print("no matching translation units")
         return []
@@ -133,24 +293,17 @@ def clang_tidy_check_and_fix(
     print(f"checking {len(files)} files across {jobs} workers")
     header_filter = f"^{re.escape(str(root))}/.*"
 
-    def check_one(f: Path) -> tuple[Path, str]:
-        proc = subprocess.run(
+    def check_one(f: Path) -> set[Path]:
+        result = runner.run(
             [binary, "-p", ".", f"-header-filter={header_filter}", str(f)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, check=False,
+            capture=True, check=False,
         )
-        return f, proc.stdout
+        return parse_diagnostics(result.stdout, root)
 
     offenders: set[Path] = set()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        for _, output in pool.map(check_one, files):
-            for line in output.splitlines():
-                m = _DIAG.match(line)
-                if not m:
-                    continue
-                offender = Path(m.group("path")).resolve()
-                if offender.is_relative_to(root):
-                    offenders.add(offender)
+        for found in pool.map(check_one, files):
+            offenders |= found
 
     sorted_offenders = sorted(offenders)
     if report_path is not None:
@@ -173,96 +326,479 @@ def clang_tidy_check_and_fix(
     print(f"fixing {len(offenders)} files serially")
     for f in sorted_offenders:
         print(f"=== FIXING: {f.relative_to(root)}")
-        subprocess.run(
-            [binary, "-p", ".", "-fix-errors", f"-header-filter={header_filter}", str(f)],
-            check=False,
-        )
+        runner.run([binary, "-p", ".", "-fix-errors", f"-header-filter={header_filter}", str(f)], check=False)
     return sorted_offenders
 
 
 # --- Built-in tasks ---
 # Contract: a task named X reads its config from cfg.tools["X"] (i.e. [X] in project.toml).
 
-def clang_tidy(cfg: Config) -> None:
+def clang_tidy(cfg: Config, runner: Runner) -> None:
     opts = cfg.tools.get("clang_tidy", {})
     clang_tidy_check_and_fix(
+        runner=runner,
         binary=opts.get("binary", "clang-tidy"),
         jobs=opts.get("jobs"),
         fix=opts.get("fix", True),
     )
 
 
-def xmake_config(cfg: Config) -> None:
-    xmake("config")
+def xmake_config(cfg: Config, runner: Runner) -> None:
+    runner.run(["xmake", "config"])
 
 
-def xmake_build(cfg: Config) -> None:
-    xmake("build")
+def xmake_build(cfg: Config, runner: Runner) -> None:
+    runner.run(["xmake", "build"])
 
 
-def npm_install(cfg: Config) -> None:
+def npm_install(cfg: Config, runner: Runner) -> None:
     pm = cfg.tools.get("npm_install", {}).get("package_manager", "npm")
-    run([pm, "install"])
+    runner.run([pm, "install"])
 
 
-def eslint(cfg: Config) -> None:
-    run(["npx", "eslint", "."])
+def eslint(cfg: Config, runner: Runner) -> None:
+    runner.run(["npx", "eslint", "."])
 
 
-def ruff(cfg: Config) -> None:
-    run(["ruff", "check", "."])
+def ruff(cfg: Config, runner: Runner) -> None:
+    runner.run(["ruff", "check", "."])
 
 
-# --- Resolver ---
-
-_PLATFORM_SUFFIX = {
-    Platform.WINDOWS: "windows",
-    Platform.MAC: "macos",
-    Platform.LINUX: "linux",
+BUILTINS: dict[str, Callable[[Config, Runner], None]] = {
+    "clang_tidy": clang_tidy,
+    "xmake_config": xmake_config,
+    "xmake_build": xmake_build,
+    "npm_install": npm_install,
+    "eslint": eslint,
+    "ruff": ruff,
 }
 
 
-def resolve_command(name: str, cfg: Config) -> list[str]:
-    # Platform-specific overrides win: `name:windows` / `name:macos` / `name:linux`
-    # falls back to the plain `name` if no platform-suffixed entry exists.
-    plat_key = f"{name}:{_PLATFORM_SUFFIX[platform()]}"
-    if plat_key in cfg.commands:
-        return list(cfg.commands[plat_key])
-    return list(cfg.commands.get(name, []))
+# --- dispatch ---
 
-
-def call(spec: str, cfg: Config) -> None:
-    if spec.startswith("$"):
-        cmd = spec[1:].lstrip()
-        if not cmd:
-            raise SystemExit(f"empty shell command: {spec!r}")
-        run(cmd, shell=True)
-        return
-
-    if ":" in spec:
-        # module.path:attr -> importlib (e.g. scripts.deploy.staging:go)
-        head, _, attr = spec.partition(":")
-        if not attr:
-            raise SystemExit(f"expected 'module:attr', got {spec!r}")
-        if str(ROOT) not in sys.path:
-            sys.path.insert(0, str(ROOT))
-        try:
-            target: Any = importlib.import_module(head)
-        except ModuleNotFoundError as e:
-            raise SystemExit(f"cannot resolve {spec!r}: {e}") from None
-        for piece in attr.split("."):
-            target = getattr(target, piece, None)
-            if target is None:
-                raise SystemExit(f"{spec!r}: no attribute {piece!r}")
-    else:
-        # plain name -> built-in function in this module
-        target = globals().get(spec)
+def _resolve_module_attr(module_path: str, attr: str, root: Path) -> Any:
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        target: Any = importlib.import_module(module_path)
+    except ModuleNotFoundError as e:
+        raise ProjectError(f"cannot resolve {module_path!r}: {e}") from None
+    for piece in attr.split("."):
+        target = getattr(target, piece, None)
         if target is None:
-            raise SystemExit(f"unknown built-in: {spec!r}")
+            raise ProjectError(f"{module_path}:{attr}: no attribute {piece!r}")
+    return target
 
+
+def dispatch(spec: str, cfg: Config, *, root: Path, runner: Runner) -> None:
+    kind, payload = classify_spec(spec)
+    if kind == "shell":
+        runner.run(payload, shell=True)
+        return
+    if kind == "builtin":
+        fn = BUILTINS.get(payload)
+        if fn is None:
+            raise ProjectError(f"unknown built-in: {spec!r}")
+        fn(cfg, runner)
+        return
+    module_path, attr = payload
+    target = _resolve_module_attr(module_path, attr, root)
     if not callable(target):
-        raise SystemExit(f"{spec!r} is not callable")
+        raise ProjectError(f"{spec!r} is not callable")
     target(cfg)
+
+
+# --- Source: where self-update / sync / presets read from ---
+# Default is GitHub. Set PROJECT_PY_SOURCE to a local checkout of this repo to read
+# everything from disk instead. The local source computes the *same* git blob shas
+# GitHub serves, so .project-sync.lock stays source-agnostic.
+
+class Source:
+    name = "?"
+
+    def ensure_ready(self) -> None:
+        """Fail fast if this source can't be used (e.g. missing credentials)."""
+
+    def read(self, path: str) -> bytes:
+        """Read a single repo-relative file's bytes."""
+        raise NotImplementedError
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        """Every blob under templates/, as (repo-relative posix path, git sha)."""
+        raise NotImplementedError
+
+    def blob(self, sha: str) -> bytes:
+        """Read a blob's bytes by the sha returned from list_blobs()."""
+        raise NotImplementedError
+
+
+class GitHubSource(Source):
+    name = "GitHub"
+
+    def __init__(self, token: str | None = None) -> None:
+        self.token = token
+
+    def ensure_ready(self) -> None:
+        if not self.token:
+            raise ProjectError(
+                "GitHub access requires GH_TOKEN. Set it to a GitHub PAT (read-only "
+                f"public-repo access is enough), or set {SOURCE_ENV} to a local checkout."
+            )
+
+    def _request(self, url: str) -> Request:
+        req = Request(url)
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        return req
+
+    def _fetch_json(self, url: str, context: str = "") -> dict | list:
+        try:
+            with urlopen(self._request(url), timeout=10) as response:
+                return json.load(response)
+        except HTTPError as e:
+            ctx = context or url
+            if e.code == 404:
+                raise ProjectError(f"Not found: {ctx}")
+            if e.code == 403:
+                raise ProjectError(f"Access denied: {ctx} (set GH_TOKEN to authenticate)")
+            raise ProjectError(f"GitHub API error ({e.code}): {ctx}")
+
+    def read(self, path: str) -> bytes:
+        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{path}?ref={TEMPLATES_REF}"
+        data = self._fetch_json(url, context=path)
+        if not isinstance(data, dict) or "content" not in data:
+            raise ProjectError(f"unexpected response for {path}")
+        return base64.b64decode(data["content"])
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
+        data = self._fetch_json(url, context="template tree")
+        if not isinstance(data, dict):
+            raise ProjectError("unexpected tree response")
+        if data.get("truncated"):
+            print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
+        return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
+
+    def blob(self, sha: str) -> bytes:
+        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/blobs/{sha}"
+        data = self._fetch_json(url, context=f"blob {sha[:8]}")
+        if not isinstance(data, dict) or "content" not in data:
+            raise ProjectError(f"unexpected blob response for {sha}")
+        return base64.b64decode(data["content"])
+
+
+class LocalSource(Source):
+    name = "local"
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._sha_to_path: dict[str, Path] = {}
+
+    def read(self, path: str) -> bytes:
+        target = self.root / path
+        if not target.is_file():
+            raise ProjectError(f"not found in local source {self.root}: {path}")
+        return git_normalize(target.read_bytes())
+
+    def list_blobs(self) -> list[tuple[str, str]]:
+        self._sha_to_path = {}
+        blobs: list[tuple[str, str]] = []
+        base = self.root / TEMPLATES_DIR
+        if not base.is_dir():
+            return blobs
+        for p in sorted(base.rglob("*")):
+            if not p.is_file():
+                continue
+            sha = git_blob_sha(git_normalize(p.read_bytes()))
+            rel = p.relative_to(self.root).as_posix()
+            blobs.append((rel, sha))
+            self._sha_to_path[sha] = p
+        return blobs
+
+    def blob(self, sha: str) -> bytes:
+        path = self._sha_to_path.get(sha)
+        if path is None:
+            raise ProjectError(f"local source: no blob for sha {sha[:8]} (call list_blobs first)")
+        return git_normalize(path.read_bytes())
+
+
+def get_source(env: dict | None = None) -> Source:
+    env = os.environ if env is None else env
+    local = env.get(SOURCE_ENV)
+    if not local:
+        return GitHubSource(env.get("GH_TOKEN"))
+    root = Path(local).expanduser().resolve()
+    if not root.is_dir():
+        raise ProjectError(f"{SOURCE_ENV}={local!r} is not a directory")
+    return LocalSource(root)
+
+
+# --- pure: classify template files into managed / write-once / append ---
+
+@dataclass
+class TemplateFiles:
+    managed: dict[str, tuple[str, str]]      # target_path -> (template, sha)
+    write_once: dict[str, tuple[str, str]]   # target_path -> (template, sha)
+    append: list[tuple[str, str, str]]       # ordered [(template, target_path, sha)]
+    warnings: list[str]
+
+
+def classify_template_files(blobs: list[tuple[str, str]], templates: list[str]) -> TemplateFiles:
+    # Sorts each template's files into a bucket by its in-template path:
+    #   _write_once_/<rest>  -> write_once, lands at <rest>
+    #   _append_/<rest>      -> append, block injected into <rest>
+    #   <rest>               -> managed (overwrite-on-change), lands at <rest>
+    # Managed: last template in the user's list wins on conflicts.
+    # Append: every contributing template gets its own block, in list order.
+    by_template: dict[str, list[tuple[str, str, str]]] = {t: [] for t in templates}
+    # Longest prefix first so nested names like "cpp/foo" claim their subtree
+    # before a broader "cpp" entry can swallow it.
+    template_prefixes = sorted(
+        ((t, f"{TEMPLATES_DIR}/{t}/") for t in templates),
+        key=lambda p: len(p[1]),
+        reverse=True,
+    )
+    write_once_marker = f"{WRITE_ONCE_DIR}/"
+    append_marker = f"{APPEND_DIR}/"
+    for path, sha in blobs:
+        for tname, tprefix in template_prefixes:
+            if path.startswith(tprefix):
+                rest = path[len(tprefix):]
+                if rest.startswith(write_once_marker):
+                    by_template[tname].append(("write_once", rest[len(write_once_marker):], sha))
+                elif rest.startswith(append_marker):
+                    by_template[tname].append(("append", rest[len(append_marker):], sha))
+                else:
+                    by_template[tname].append(("managed", rest, sha))
+                break
+
+    warnings: list[str] = []
+    missing = [t for t in templates if not by_template[t]]
+    if missing:
+        warnings.append(f"warning: no files found for template(s): {', '.join(missing)}")
+
+    managed: dict[str, tuple[str, str]] = {}
+    write_once: dict[str, tuple[str, str]] = {}
+    append: list[tuple[str, str, str]] = []
+    for tname in templates:
+        for kind, rel, sha in by_template[tname]:
+            if kind == "managed":
+                managed[rel] = (tname, sha)
+            elif kind == "write_once":
+                write_once[rel] = (tname, sha)
+            else:
+                append.append((tname, rel, sha))
+
+    # If a path is both managed and an append target, append wins.
+    append_targets = {p for _, p, _ in append}
+    for c in sorted(set(managed) & append_targets):
+        warnings.append(f"warning: {c!r} is both managed and append; treating as append")
+        managed.pop(c, None)
+
+    return TemplateFiles(managed, write_once, append, warnings)
+
+
+# --- pure: append-block merge ---
+
+_BLOCK_START_RE = re.compile(r"# \[START (.+?)\]")
+
+
+def format_append_block(name: str, body: str) -> str:
+    return f"# [START {name}]\n{body.rstrip(chr(10))}\n# [END {name}]\n"
+
+
+def merge_append_blocks(existing: str, blocks: dict[str, str]) -> str:
+    # blocks: {template_name: block body without markers}. Returns the new file text.
+    # Replaces existing # [START name] / # [END name] regions in place, appends new
+    # blocks at the end, and strips blocks whose template is no longer wanted.
+    new = existing
+    existing_names = set(_BLOCK_START_RE.findall(new))
+    wanted_names = set(blocks)
+
+    # Replace blocks we want and that already exist. A function replacement is used
+    # (not a replacement string) so block bodies containing backslashes / \1 etc.
+    # are inserted literally rather than interpreted by re.
+    for name in wanted_names & existing_names:
+        pattern = re.compile(
+            r"# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
+            re.DOTALL,
+        )
+        new = pattern.sub(lambda _m, n=name: format_append_block(n, blocks[n]), new, count=1)
+
+    # Strip blocks we no longer want (and any single trailing blank line that follows).
+    for name in existing_names - wanted_names:
+        pattern = re.compile(
+            r"\n?# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
+            re.DOTALL,
+        )
+        new = pattern.sub("", new, count=1)
+
+    # Append new blocks for templates not previously present.
+    for name in (n for n in blocks if n not in existing_names):
+        if new and not new.endswith("\n"):
+            new += "\n"
+        if new and not new.endswith("\n\n"):
+            new += "\n"
+        new += format_append_block(name, blocks[name])
+
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    if new and not new.endswith("\n"):
+        new += "\n"
+    return new
+
+
+def strip_all_blocks(text: str) -> str:
+    # Remove every `# [START …]` / `# [END …]` block; collapse blank-line runs.
+    new = re.sub(r"\n?# \[START .+?\]\n.*?\n# \[END .+?\]\n?", "", text, flags=re.DOTALL)
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    return new
+
+
+# --- pure: .project-sync.lock parse / format ---
+
+def parse_lock(text: str) -> tuple[str, dict[str, str], set[str]]:
+    # Returns (cfg_hash, managed_path -> sha, append_paths). Pre-section files (no
+    # [cfg_hash]/[managed]/[append] headers) are treated as all-managed for backward compat.
+    cfg_hash_val = ""
+    managed: dict[str, str] = {}
+    append: set[str] = set()
+    section = "managed"
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section == "cfg_hash":
+            cfg_hash_val = line
+        elif section == "managed":
+            sha, _, path = line.partition("  ")
+            if sha and path:
+                managed[path] = sha
+        elif section == "append":
+            append.add(line)
+    return cfg_hash_val, managed, append
+
+
+def format_lock(cfg_hash_val: str, managed: dict[str, str], append: set[str]) -> str:
+    lines = [
+        "# .project-sync.lock — written by `project.py sync`. Do not edit.",
+        "",
+        "[cfg_hash]",
+        cfg_hash_val,
+    ]
+    if managed:
+        lines.append("")
+        lines.append("[managed]")
+        for path in sorted(managed):
+            lines.append(f"{managed[path]}  {path}")
+    if append:
+        lines.append("")
+        lines.append("[append]")
+        for path in sorted(append):
+            lines.append(path)
+    return "\n".join(lines) + "\n"
+
+
+# --- sync (effectful shell) ---
+
+def sync(cfg: Config, *, root: Path, source: Source) -> None:
+    source.ensure_ready()
+
+    templates = cfg.tools.get("sync", {}).get("templates", [])
+    if not templates:
+        raise ProjectError("no [sync].templates defined in project.toml")
+
+    print(f"syncing {len(templates)} template(s) from {source.name}: {', '.join(templates)}")
+    files = classify_template_files(source.list_blobs(), templates)
+    for w in files.warnings:
+        print(w, file=sys.stderr)
+
+    lock_path = root / SYNC_LOCK_NAME
+    old_text = lock_path.read_text(encoding="utf-8") if lock_path.exists() else ""
+    old_cfg_hash, old_managed, old_append = parse_lock(old_text)
+    new_cfg_hash = cfg_hash(cfg)
+    cfg_changed = new_cfg_hash != old_cfg_hash
+    lookup = build_var_lookup(cfg)
+
+    written = skipped = seeded = preserved = merged = stripped = deleted = 0
+    new_managed: dict[str, str] = {}
+
+    for path, (tname, sha) in sorted(files.managed.items()):
+        target = root / path
+        new_managed[path] = sha
+        if not cfg_changed and old_managed.get(path) == sha and target.exists():
+            skipped += 1
+            continue
+        content = substitute(source.blob(sha), lookup)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        print(f"  wrote {path}  ({tname})")
+        written += 1
+
+    for path, (tname, sha) in sorted(files.write_once.items()):
+        target = root / path
+        if target.exists():
+            preserved += 1
+            continue
+        content = substitute(source.blob(sha), lookup)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        print(f"  seeded {path}  ({tname})")
+        seeded += 1
+
+    # Group append entries by destination, preserving template list order per path.
+    append_by_target: dict[str, list[tuple[str, str]]] = {}
+    for tname, path, sha in files.append:
+        append_by_target.setdefault(path, []).append((tname, sha))
+
+    new_append_paths: set[str] = set()
+    for path, entries in sorted(append_by_target.items()):
+        new_append_paths.add(path)
+        target = root / path
+        blocks = {tname: substitute(source.blob(sha), lookup).decode("utf-8") for tname, sha in entries}
+        existing = target.read_text(encoding="utf-8") if target.exists() else ""
+        new = merge_append_blocks(existing, blocks)
+        if new != existing:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new, encoding="utf-8")
+            print(f"  merged {path}  ({', '.join(t for t, _ in entries)})")
+            merged += 1
+
+    # Delete managed files that fell out — unless they're now append targets.
+    for path in sorted(set(old_managed) - set(new_managed) - new_append_paths):
+        target = root / path
+        if target.exists():
+            try:
+                target.unlink()
+                print(f"  deleted {path}")
+                deleted += 1
+            except OSError as e:
+                print(f"  could not delete {path}: {e}", file=sys.stderr)
+
+    # Strip our blocks from files that used to be append targets but aren't anymore.
+    for path in sorted(old_append - new_append_paths - set(new_managed)):
+        target = root / path
+        if not target.exists():
+            continue
+        existing = target.read_text(encoding="utf-8")
+        new = strip_all_blocks(existing)
+        if new.strip() == "":
+            target.unlink()
+            print(f"  unmerged {path}")
+            stripped += 1
+        elif new != existing:
+            target.write_text(new, encoding="utf-8")
+            print(f"  unmerged {path}")
+            stripped += 1
+
+    lock_path.write_text(format_lock(new_cfg_hash, new_managed, new_append_paths), encoding="utf-8")
+    print(
+        f"sync done: {written} written, {skipped} unchanged, "
+        f"{seeded} seeded, {preserved} preserved, "
+        f"{merged} merged, {stripped} unmerged, {deleted} deleted"
+    )
 
 
 # --- init ---
@@ -309,547 +845,48 @@ name = "{name}"
 """
 
 
-def _fetch_preset(name: str, source: Source) -> str:
-    return source.read(f"presets/{name}.toml").decode("utf-8")
-
-
-def init(preset: str | None = None) -> None:
-    if TOML_PATH.exists():
-        print(f"{TOML_PATH.name} already exists.", file=sys.stderr)
-        raise SystemExit(1)
+def init(root: Path, preset: str | None = None, *, source: Source | None = None, runner: Runner | None = None) -> None:
+    toml_path = root / TOML_NAME
+    if toml_path.exists():
+        raise ProjectError(f"{TOML_NAME} already exists.")
 
     if preset is None:
-        TOML_PATH.write_text(_TOML_TEMPLATE.format(name=ROOT.name), encoding="utf-8")
-        print(f"wrote {TOML_PATH}")
+        toml_path.write_text(_TOML_TEMPLATE.format(name=root.name), encoding="utf-8")
+        print(f"wrote {toml_path}")
         return
 
-    source = get_source()
+    if source is None:
+        source = get_source()
     source.ensure_ready()
 
-    body = _fetch_preset(preset, source)
+    body = source.read(f"presets/{preset}.toml").decode("utf-8")
     if not body.endswith("\n"):
         body += "\n"
-    header = f'[project]\nname = "{ROOT.name}"\n\n'
-    TOML_PATH.write_text(header + body, encoding="utf-8")
-    print(f"wrote {TOML_PATH} (preset: {preset})")
+    header = f'[project]\nname = "{root.name}"\n\n'
+    toml_path.write_text(header + body, encoding="utf-8")
+    print(f"wrote {toml_path} (preset: {preset})")
 
-    cfg = Config.load()
+    cfg = Config.load(toml_path)
     if cfg.tools.get("sync", {}).get("templates"):
         print("running sync...")
-        sync(cfg)
+        sync(cfg, root=root, source=source)
 
-    setup_tasks = resolve_command("setup", cfg)
+    setup_tasks = resolve_command("setup", cfg.commands, platform())
     if setup_tasks:
         print("running setup...")
+        runner = runner or Runner()
         for spec in setup_tasks:
-            call(spec, cfg)
+            dispatch(spec, cfg, root=root, runner=runner)
 
 
-# --- GitHub helpers + self-update ---
+# --- self-update ---
 
-def _github_request(url: str) -> Request:
-    req = Request(url)
-    token = os.environ.get("GH_TOKEN")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    return req
-
-
-def _github_fetch_json(url: str, context: str = "") -> dict | list:
-    try:
-        with urlopen(_github_request(url), timeout=10) as response:
-            return json.load(response)
-    except HTTPError as e:
-        ctx = context or url
-        if e.code == 404:
-            print(f"Not found: {ctx}", file=sys.stderr)
-        elif e.code == 403:
-            print(f"Access denied: {ctx} (set GH_TOKEN to authenticate)", file=sys.stderr)
-        else:
-            print(f"GitHub API error ({e.code}): {ctx}", file=sys.stderr)
-        raise SystemExit(1)
-
-
-def _github_blob_bytes(sha: str) -> bytes:
-    url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/blobs/{sha}"
-    data = _github_fetch_json(url, context=f"blob {sha[:8]}")
-    if not isinstance(data, dict) or "content" not in data:
-        print(f"unexpected blob response for {sha}", file=sys.stderr)
-        raise SystemExit(1)
-    return base64.b64decode(data["content"])
-
-
-# --- Source: where self-update / sync / presets read from ---
-# Default is GitHub. Set PROJECT_PY_SOURCE to a local checkout of this repo to
-# read everything from disk instead — handy for developing templates/presets/
-# project.py itself without pushing. The local source computes the *same* git
-# blob shas GitHub would, so .project-sync.lock stays source-agnostic: you can
-# sync from local, push, then sync from GitHub elsewhere with no spurious churn.
-
-SOURCE_ENV = "PROJECT_PY_SOURCE"
-
-
-def _git_normalize(data: bytes) -> bytes:
-    # Mirror git's default text handling so local shas/bytes match what GitHub
-    # serves. Git stores text blobs LF-normalized (autocrlf clean), and the API
-    # returns those LF bytes — but a Windows working tree often has CRLF. Files
-    # with a NUL byte are treated as binary and passed through untouched, same
-    # as git's own text/binary heuristic.
-    if b"\x00" in data:
-        return data
-    return data.replace(b"\r\n", b"\n")
-
-
-def _git_blob_sha(data: bytes) -> str:
-    # Matches `git hash-object` on git-stored (LF-normalized) content: the sha1
-    # of "blob <len>\0" + content. Feed already-normalized bytes.
-    h = hashlib.sha1()
-    h.update(b"blob " + str(len(data)).encode() + b"\x00")
-    h.update(data)
-    return h.hexdigest()
-
-
-class Source:
-    name = "?"
-
-    def ensure_ready(self) -> None:
-        """Fail fast if this source can't be used (e.g. missing credentials)."""
-
-    def read(self, path: str) -> bytes:
-        """Read a single repo-relative file's bytes."""
-        raise NotImplementedError
-
-    def list_blobs(self) -> list[tuple[str, str]]:
-        """Every blob under templates/, as (repo-relative posix path, git sha)."""
-        raise NotImplementedError
-
-    def blob(self, sha: str) -> bytes:
-        """Read a blob's bytes by the sha returned from list_blobs()."""
-        raise NotImplementedError
-
-
-class GitHubSource(Source):
-    name = "GitHub"
-
-    def ensure_ready(self) -> None:
-        if not os.environ.get("GH_TOKEN"):
-            print(
-                "GitHub access requires GH_TOKEN. Set it to a GitHub PAT "
-                "(read-only public-repo access is enough), or set "
-                f"{SOURCE_ENV} to a local checkout.",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-
-    def read(self, path: str) -> bytes:
-        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/contents/{path}?ref={TEMPLATES_REF}"
-        data = _github_fetch_json(url, context=path)
-        if not isinstance(data, dict) or "content" not in data:
-            print(f"unexpected response for {path}", file=sys.stderr)
-            raise SystemExit(1)
-        return base64.b64decode(data["content"])
-
-    def list_blobs(self) -> list[tuple[str, str]]:
-        url = f"https://api.github.com/repos/{SELF_UPDATE_REPO}/git/trees/{TEMPLATES_REF}?recursive=1"
-        data = _github_fetch_json(url, context="template tree")
-        if not isinstance(data, dict):
-            print("unexpected tree response", file=sys.stderr)
-            raise SystemExit(1)
-        if data.get("truncated"):
-            print("warning: GitHub tree response was truncated; some templates may be incomplete", file=sys.stderr)
-        return [(e["path"], e["sha"]) for e in data.get("tree", []) if e.get("type") == "blob"]
-
-    def blob(self, sha: str) -> bytes:
-        return _github_blob_bytes(sha)
-
-
-class LocalSource(Source):
-    name = "local"
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self._sha_to_path: dict[str, Path] = {}
-
-    def read(self, path: str) -> bytes:
-        target = self.root / path
-        if not target.is_file():
-            print(f"not found in local source {self.root}: {path}", file=sys.stderr)
-            raise SystemExit(1)
-        return _git_normalize(target.read_bytes())
-
-    def list_blobs(self) -> list[tuple[str, str]]:
-        self._sha_to_path = {}
-        blobs: list[tuple[str, str]] = []
-        base = self.root / TEMPLATES_DIR
-        if not base.is_dir():
-            return blobs
-        for p in sorted(base.rglob("*")):
-            if not p.is_file():
-                continue
-            sha = _git_blob_sha(_git_normalize(p.read_bytes()))
-            rel = p.relative_to(self.root).as_posix()
-            blobs.append((rel, sha))
-            self._sha_to_path[sha] = p
-        return blobs
-
-    def blob(self, sha: str) -> bytes:
-        path = self._sha_to_path.get(sha)
-        if path is None:
-            raise SystemExit(f"local source: no blob for sha {sha[:8]} (call list_blobs first)")
-        return _git_normalize(path.read_bytes())
-
-
-def get_source() -> Source:
-    local = os.environ.get(SOURCE_ENV)
-    if not local:
-        return GitHubSource()
-    root = Path(local).expanduser().resolve()
-    if not root.is_dir():
-        print(f"{SOURCE_ENV}={local!r} is not a directory", file=sys.stderr)
-        raise SystemExit(1)
-    return LocalSource(root)
-
-
-# --- sync ---
-
-def _read_sync_lock() -> tuple[str, dict[str, str], set[str]]:
-    # Returns (cfg_hash, managed_path -> sha, append_paths). Pre-section files (no
-    # [cfg_hash]/[managed]/[append] headers) are treated as all-managed for backward compat.
-    if not SYNC_LOCK_PATH.exists():
-        return "", {}, set()
-    cfg_hash = ""
-    managed: dict[str, str] = {}
-    append: set[str] = set()
-    section = "managed"
-    for raw in SYNC_LOCK_PATH.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1]
-            continue
-        if section == "cfg_hash":
-            cfg_hash = line
-        elif section == "managed":
-            sha, _, path = line.partition("  ")
-            if sha and path:
-                managed[path] = sha
-        elif section == "append":
-            append.add(line)
-    return cfg_hash, managed, append
-
-
-def _write_sync_lock(cfg_hash: str, managed: dict[str, str], append: set[str]) -> None:
-    lines = [
-        "# .project-sync.lock — written by `project.py sync`. Do not edit.",
-        "",
-        "[cfg_hash]",
-        cfg_hash,
-    ]
-    if managed:
-        lines.append("")
-        lines.append("[managed]")
-        for path in sorted(managed):
-            lines.append(f"{managed[path]}  {path}")
-    if append:
-        lines.append("")
-        lines.append("[append]")
-        for path in sorted(append):
-            lines.append(path)
-    SYNC_LOCK_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-# --- variable substitution: {{section.key}} ---
-
-_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*)\s*\}\}")
-
-
-def _scalar(v: Any) -> str | None:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (str, int, float)):
-        return str(v)
-    return None
-
-
-def _build_var_lookup(cfg: Config) -> dict[str, str]:
-    flat: dict[str, str] = {}
-    for k, v in cfg.project.items():
-        s = _scalar(v)
-        if s is not None:
-            flat[f"project.{k}"] = s
-    for section, body in cfg.tools.items():
-        if not isinstance(body, dict):
-            continue
-        for k, v in body.items():
-            s = _scalar(v)
-            if s is not None:
-                flat[f"{section}.{k}"] = s
-    return flat
-
-
-def _substitute(content: bytes, lookup: dict[str, str]) -> bytes:
-    if not lookup:
-        return content
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return content
-    new_text = _VAR_RE.sub(lambda m: lookup.get(m.group(1), m.group(0)), text)
-    if new_text == text:
-        return content
-    return new_text.encode("utf-8")
-
-
-def _cfg_hash(cfg: Config) -> str:
-    payload = json.dumps(
-        {"project": cfg.project, "tools": cfg.tools},
-        sort_keys=True,
-        default=str,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _list_template_files(
-    templates: list[str],
-    source: Source,
-) -> tuple[
-    dict[str, tuple[str, str]],       # managed: target_path -> (template, sha)
-    dict[str, tuple[str, str]],       # write_once: target_path -> (template, sha)
-    list[tuple[str, str, str]],       # append: ordered [(template, target_path, sha)]
-]:
-    # Sorts each template's files into one of three buckets based on its in-template path:
-    #   _write_once_/<rest>   -> write_once, lands at <rest>
-    #   _append_/<rest>       -> append, block injected into <rest>
-    #   <rest>                -> managed (overwrite-on-change), lands at <rest>
-    # Managed: last template in the user's list wins on conflicts.
-    # Append: every contributing template gets its own block in the destination file, in list order.
-    Bucket = tuple[str, str, str]  # (kind, target_relpath, sha)
-    by_template: dict[str, list[Bucket]] = {t: [] for t in templates}
-    # Longest prefix first so nested names like "cpp/foo" claim their subtree
-    # before a broader "cpp" entry can swallow it.
-    template_prefixes = sorted(
-        ((t, f"{TEMPLATES_DIR}/{t}/") for t in templates),
-        key=lambda p: len(p[1]),
-        reverse=True,
-    )
-    write_once_marker = f"{WRITE_ONCE_DIR}/"
-    append_marker = f"{APPEND_DIR}/"
-    for path, sha in source.list_blobs():
-        for tname, tprefix in template_prefixes:
-            if path.startswith(tprefix):
-                rest = path[len(tprefix):]
-                if rest.startswith(write_once_marker):
-                    by_template[tname].append(("write_once", rest[len(write_once_marker):], sha))
-                elif rest.startswith(append_marker):
-                    by_template[tname].append(("append", rest[len(append_marker):], sha))
-                else:
-                    by_template[tname].append(("managed", rest, sha))
-                break
-
-    missing = [t for t in templates if not by_template[t]]
-    if missing:
-        print(f"warning: no files found for template(s): {', '.join(missing)}", file=sys.stderr)
-
-    managed: dict[str, tuple[str, str]] = {}
-    write_once: dict[str, tuple[str, str]] = {}
-    append: list[tuple[str, str, str]] = []
-    for tname in templates:
-        for kind, rel, sha in by_template[tname]:
-            if kind == "managed":
-                managed[rel] = (tname, sha)
-            elif kind == "write_once":
-                write_once[rel] = (tname, sha)
-            else:  # append
-                append.append((tname, rel, sha))
-
-    # If any path appears as append, that wins over managed for the same path.
-    # Warn so template authors notice the conflict.
-    append_targets = {p for _, p, _ in append}
-    conflicts = sorted(set(managed) & append_targets)
-    for c in conflicts:
-        print(f"warning: {c!r} is both managed and append; treating as append", file=sys.stderr)
-        managed.pop(c, None)
-
-    return managed, write_once, append
-
-
-# --- append-block merge ---
-
-_BLOCK_START_RE = re.compile(r"# \[START (.+?)\]")
-
-
-def _format_append_block(name: str, body: str) -> str:
-    return f"# [START {name}]\n{body.rstrip(chr(10))}\n# [END {name}]\n"
-
-
-def _merge_append_blocks(file_path: Path, blocks: dict[str, str]) -> bool:
-    # blocks: {template_name: block body without markers}. Returns True if file changed on disk.
-    # Replaces existing # [START name] / # [END name] regions in place; appends new blocks
-    # at the end; strips blocks whose template name is not in `blocks`.
-    existing = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
-    new = existing
-
-    existing_names = set(_BLOCK_START_RE.findall(new))
-    wanted_names = set(blocks)
-
-    # Replace blocks we want and that already exist
-    for name in wanted_names & existing_names:
-        pattern = re.compile(
-            r"# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
-            re.DOTALL,
-        )
-        new = pattern.sub(_format_append_block(name, blocks[name]), new, count=1)
-
-    # Strip blocks we no longer want (and any single trailing blank line that follows)
-    for name in existing_names - wanted_names:
-        pattern = re.compile(
-            r"\n?# \[START " + re.escape(name) + r"\]\n.*?\n# \[END " + re.escape(name) + r"\]\n?",
-            re.DOTALL,
-        )
-        new = pattern.sub("", new, count=1)
-
-    # Append new blocks for templates not previously present
-    for name in (n for n in blocks if n not in existing_names):
-        if new and not new.endswith("\n"):
-            new += "\n"
-        if new and not new.endswith("\n\n"):
-            new += "\n"
-        new += _format_append_block(name, blocks[name])
-
-    # Collapse runs of 3+ blank lines to 2
-    new = re.sub(r"\n{3,}", "\n\n", new)
-    if new and not new.endswith("\n"):
-        new += "\n"
-
-    if new == existing:
-        return False
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(new, encoding="utf-8")
-    return True
-
-
-def _strip_all_our_blocks(file_path: Path) -> bool:
-    # Strip every `# [START …]` / `# [END …]` block from a file that's no longer an append target.
-    # Returns True if file changed; deletes the file if it becomes empty.
-    if not file_path.exists():
-        return False
-    existing = file_path.read_text(encoding="utf-8")
-    new = re.sub(
-        r"\n?# \[START .+?\]\n.*?\n# \[END .+?\]\n?",
-        "",
-        existing,
-        flags=re.DOTALL,
-    )
-    new = re.sub(r"\n{3,}", "\n\n", new)
-    if new.strip() == "":
-        file_path.unlink()
-        return True
-    if new == existing:
-        return False
-    file_path.write_text(new, encoding="utf-8")
-    return True
-
-
-def sync(cfg: Config) -> None:
-    source = get_source()
-    source.ensure_ready()
-
-    opts = cfg.tools.get("sync", {})
-    templates = opts.get("templates", [])
-    if not templates:
-        print("no [sync].templates defined in project.toml", file=sys.stderr)
-        raise SystemExit(1)
-
-    print(f"syncing {len(templates)} template(s) from {source.name}: {', '.join(templates)}")
-    managed, write_once, append = _list_template_files(templates, source)
-    old_cfg_hash, old_managed, old_append = _read_sync_lock()
-    new_cfg_hash = _cfg_hash(cfg)
-    cfg_changed = new_cfg_hash != old_cfg_hash
-    lookup = _build_var_lookup(cfg)
-    new_managed: dict[str, str] = {}
-
-    written = 0
-    skipped = 0
-    seeded = 0
-    preserved = 0
-    for path, (tname, sha) in sorted(managed.items()):
-        target = ROOT / path
-        new_managed[path] = sha
-        if not cfg_changed and old_managed.get(path) == sha and target.exists():
-            skipped += 1
-            continue
-        content = _substitute(source.blob(sha), lookup)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        print(f"  wrote {path}  ({tname})")
-        written += 1
-
-    for path, (tname, sha) in sorted(write_once.items()):
-        target = ROOT / path
-        if target.exists():
-            preserved += 1
-            continue
-        content = _substitute(source.blob(sha), lookup)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        print(f"  seeded {path}  ({tname})")
-        seeded += 1
-
-    # Group append entries by destination path, preserving template list order per path.
-    append_by_target: dict[str, list[tuple[str, str]]] = {}
-    for tname, path, sha in append:
-        append_by_target.setdefault(path, []).append((tname, sha))
-
-    merged = 0
-    new_append_paths: set[str] = set()
-    for path, entries in sorted(append_by_target.items()):
-        new_append_paths.add(path)
-        target = ROOT / path
-        blocks: dict[str, str] = {}
-        for tname, sha in entries:
-            blob = _substitute(source.blob(sha), lookup)
-            blocks[tname] = blob.decode("utf-8")
-        if _merge_append_blocks(target, blocks):
-            print(f"  merged {path}  ({', '.join(t for t, _ in entries)})")
-            merged += 1
-
-    # Delete managed files that fell out — but not if they're now append targets.
-    deleted = 0
-    for path in sorted(set(old_managed) - set(new_managed) - new_append_paths):
-        target = ROOT / path
-        if target.exists():
-            try:
-                target.unlink()
-                print(f"  deleted {path}")
-                deleted += 1
-            except OSError as e:
-                print(f"  could not delete {path}: {e}", file=sys.stderr)
-
-    # Strip our blocks from files that used to be append targets but aren't anymore.
-    stripped = 0
-    for path in sorted(old_append - new_append_paths - set(new_managed)):
-        target = ROOT / path
-        if _strip_all_our_blocks(target):
-            print(f"  unmerged {path}")
-            stripped += 1
-
-    _write_sync_lock(new_cfg_hash, new_managed, new_append_paths)
-    print(
-        f"sync done: {written} written, {skipped} unchanged, "
-        f"{seeded} seeded, {preserved} preserved, "
-        f"{merged} merged, {stripped} unmerged, {deleted} deleted"
-    )
-
-
-def self_update() -> None:
-    source = get_source()
+def self_update(*, script_path: Path, source: Source) -> None:
     try:
         new_content = source.read(SELF_UPDATE_PATH)
-    except SystemExit:
-        print("Failed to check for updates.", file=sys.stderr)
+    except ProjectError as e:
+        print(f"Failed to check for updates: {e}", file=sys.stderr)
         return
-    script_path = Path(__file__).resolve()
     old_content = script_path.read_bytes()
     if new_content == old_content:
         print("Already up to date.")
@@ -913,18 +950,23 @@ GitHub rate limits.""",
 }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    root: Path | None = None,
+    source: Source | None = None,
+    runner: Runner | None = None,
+    env: dict | None = None,
+    script_path: Path | None = None,
+) -> int:
     # `argparse.REMAINDER` swallows `-h` / `--help` / `--version` when they appear
     # after the command. Intercept those before argparse so help and version work
     # no matter where they're typed.
     raw = list(sys.argv[1:] if argv is None else argv)
 
-    # Per-built-in help: `init -h`, `sync --help`, etc. show command-specific help.
     if raw and raw[0] in _COMMAND_HELP and ("-h" in raw[1:] or "--help" in raw[1:]):
         print(_COMMAND_HELP[raw[0]])
         return 0
-
-    # Top-level: no args at all, or -h/--help in the leading position.
     if not raw or raw[0] in ("-h", "--help"):
         build_parser().print_help()
         return 0
@@ -932,30 +974,41 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
-    parser = build_parser()
-    ns = parser.parse_args(raw)
+    ns = build_parser().parse_args(raw)
 
-    if ns.command == "self-update":
-        self_update()
+    root = root or Path(__file__).resolve().parent
+    runner = runner or Runner()
+
+    try:
+        if ns.command == "self-update":
+            src = source if source is not None else get_source(env)
+            self_update(script_path=script_path or Path(__file__).resolve(), source=src)
+            return 0
+
+        if ns.command == "init":
+            preset = ns.args[0] if ns.args else None
+            src = (source if source is not None else get_source(env)) if preset else None
+            init(root, preset, source=src, runner=runner)
+            return 0
+
+        cfg = Config.load(root / TOML_NAME)
+        cfg.args = ns.args
+
+        if ns.command == "sync":
+            src = source if source is not None else get_source(env)
+            sync(cfg, root=root, source=src)
+            return 0
+
+        tasks = resolve_command(ns.command, cfg.commands, platform())
+        if not tasks:
+            print(f"no '{ns.command}' defined in [commands]", file=sys.stderr)
+            return 2
+        for spec in tasks:
+            dispatch(spec, cfg, root=root, runner=runner)
         return 0
-    if ns.command == "init":
-        init(ns.args[0] if ns.args else None)
-        return 0
-
-    cfg = Config.load()
-    cfg.args = ns.args
-
-    if ns.command == "sync":
-        sync(cfg)
-        return 0
-
-    tasks = resolve_command(ns.command, cfg)
-    if not tasks:
-        print(f"no '{ns.command}' defined in [commands]", file=sys.stderr)
-        return 2
-    for spec in tasks:
-        call(spec, cfg)
-    return 0
+    except ProjectError as e:
+        print(e, file=sys.stderr)
+        return e.exit_code
 
 
 if __name__ == "__main__":

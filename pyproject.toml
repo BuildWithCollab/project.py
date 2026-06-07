@@ -1,0 +1,17 @@
+[project]
+name = "project-py"
+version = "0.1.0"
+description = "Single-file per-repo CLI runner."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "assertpy>=1.1",
+    "pytest>=8.0",
+    "pytest-sugar>=1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
