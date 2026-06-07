@@ -37,6 +37,23 @@ class TestInitPreset:
         # setup chained -> runner saw `xmake config`
         assert_that([c.cmd for c in runner.calls]).contains(["xmake", "config"])
 
+    def test_chained_sync_honors_preset_repos_not_default(self, tmp_path):
+        # The preset (read off the local path) declares repos = [] — local-only — and asks
+        # for a template that is NOT on the path. Fixed wiring builds the chained-sync
+        # source from the preset's OWN repos ([] -> no github), so the missing template is
+        # just a warning. The old bug reused the DEFAULT github source, which would fall
+        # through to BuildWithCollab and raise on the missing GH_TOKEN. No token set here,
+        # so reaching github at all would fail the test.
+        pathsrc = tmp_path / "pathsrc"
+        (pathsrc / "presets").mkdir(parents=True)
+        (pathsrc / "presets" / "x.toml").write_bytes(
+            b'[sources]\nrepos = []\n\n[sync]\ntemplates = ["ghost"]\n'
+        )
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        init(proj, "x", env={"PROJECT_PY_PATH": str(pathsrc)})  # must not raise
+        assert_that((proj / "project.toml").read_text()).contains('templates = ["ghost"]')
+
     def test_preset_without_sync_or_setup(self, tmp_path):
         src = DictSource({"presets/min.toml": b'[commands]\nbuild = ["xmake_build"]\n'})
         runner = RecordingRunner()

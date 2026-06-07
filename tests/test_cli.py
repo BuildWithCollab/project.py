@@ -48,6 +48,20 @@ class TestCommandRouting:
         assert_that(main(["sync"], root=tmp_path, source=src)).is_equal_to(0)
         assert_that((tmp_path / ".gitattributes").exists()).is_true()
 
+    def test_sync_builds_source_from_env_and_toml(self, tmp_path):
+        # No injected source: main must assemble the search path itself from
+        # repos_for(cfg) + PROJECT_PY_PATH. repos = [] means no github, so this whole
+        # path runs with no GH_TOKEN and no network.
+        src = tmp_path / "src"
+        (src / "templates" / "git").mkdir(parents=True)
+        (src / "templates" / "git" / ".gitattributes").write_bytes(b"* text=auto\n")
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "project.toml").write_text('[sources]\nrepos = []\n\n[sync]\ntemplates = ["git"]\n')
+        rc = main(["sync"], root=proj, env={"PROJECT_PY_PATH": str(src)})
+        assert_that(rc).is_equal_to(0)
+        assert_that((proj / ".gitattributes").read_bytes()).is_equal_to(b"* text=auto\n")
+
     def test_init_via_main(self, tmp_path):
         assert_that(main(["init"], root=tmp_path)).is_equal_to(0)
         assert_that((tmp_path / "project.toml").exists()).is_true()

@@ -1,12 +1,15 @@
 from assertpy import assert_that
 
 from project import (
+    DEFAULT_REPOS,
+    Config,
     GitHubSource,
     LocalSource,
     ProjectError,
     SearchPathSource,
     get_source,
     git_blob_sha,
+    repos_for,
 )
 from tests._fakes import DictSource
 
@@ -165,6 +168,36 @@ class TestSearchPathSource:
         # when list_blobs actually reaches a child.
         sp = SearchPathSource([DictSource({}, ready=True), DictSource({}, ready=False)])
         sp.ensure_ready()  # does not raise
+
+    def test_no_hint_returns_full_merged_tree(self):
+        # Source contract: a composite given no `wanted` hint returns everything, first
+        # source winning per top-level template. (Exercises the wanted=None branch.)
+        a = DictSource({"templates/cpp/x.lua": b"a\n"})
+        b = DictSource({"templates/cpp/x.lua": b"b\n", "templates/git/.gitignore": b"g\n"})
+        sp = SearchPathSource([a, b])
+        blobs = dict(sp.list_blobs())
+        assert_that(sorted(blobs)).is_equal_to(
+            ["templates/cpp/x.lua", "templates/git/.gitignore"]
+        )
+        assert_that(sp.blob(blobs["templates/cpp/x.lua"])).is_equal_to(b"a\n")
+
+
+class TestReposFor:
+    def test_default_when_absent(self):
+        assert_that(repos_for(Config())).is_equal_to(DEFAULT_REPOS)
+
+    def test_does_not_alias_the_default(self):
+        # Mutating the returned list must not corrupt the module-level DEFAULT_REPOS.
+        repos_for(Config()).append("junk/repo")
+        assert_that(DEFAULT_REPOS).does_not_contain("junk/repo")
+
+    def test_string_coerced_to_single_repo_list(self):
+        cfg = Config(tools={"sources": {"repos": "owner/repo"}})
+        assert_that(repos_for(cfg)).is_equal_to(["owner/repo"])
+
+    def test_list_passthrough(self):
+        cfg = Config(tools={"sources": {"repos": ["a/b", "c/d"]}})
+        assert_that(repos_for(cfg)).is_equal_to(["a/b", "c/d"])
 
 
 class TestGitHubSourceReady:

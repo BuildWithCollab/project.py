@@ -990,7 +990,14 @@ name = "{name}"
 """
 
 
-def init(root: Path, preset: str | None = None, *, source: Source | None = None, runner: Runner | None = None) -> None:
+def init(
+    root: Path,
+    preset: str | None = None,
+    *,
+    source: Source | None = None,
+    runner: Runner | None = None,
+    env: dict | None = None,
+) -> None:
     toml_path = root / TOML_NAME
     if toml_path.exists():
         raise ProjectError(f"{TOML_NAME} already exists.")
@@ -1000,9 +1007,11 @@ def init(root: Path, preset: str | None = None, *, source: Source | None = None,
         print(f"wrote {toml_path}")
         return
 
-    # Presets live alongside templates, so the preset itself comes off the default
-    # search path. The synced templates, though, honor the preset's own [sources].repos.
-    preset_source = source or get_source(DEFAULT_REPOS)
+    # The preset itself can't yet know its own [sources] (we're about to write it), so
+    # it's read off the DEFAULT search path. The chained sync, however, is built AFTER
+    # the preset is loaded, so it honors the preset's own [sources].repos. An injected
+    # source (tests) overrides both.
+    preset_source = source or get_source(DEFAULT_REPOS, env)
     preset_source.ensure_ready()
 
     body = preset_source.read(f"presets/{preset}.toml").decode("utf-8")
@@ -1015,7 +1024,7 @@ def init(root: Path, preset: str | None = None, *, source: Source | None = None,
     cfg = Config.load(toml_path)
     if cfg.tools.get("sync", {}).get("templates"):
         print("running sync...")
-        sync(cfg, root=root, source=source or get_source(repos_for(cfg)))
+        sync(cfg, root=root, source=source or get_source(repos_for(cfg), env))
 
     setup_tasks = resolve_command("setup", cfg.commands, platform())
     if setup_tasks:
@@ -1141,8 +1150,9 @@ def main(
 
         if ns.command == "init":
             preset = ns.args[0] if ns.args else None
-            src = (source if source is not None else get_source(DEFAULT_REPOS, env)) if preset else None
-            init(root, preset, source=src, runner=runner)
+            # Don't pre-build a source here: init reads the preset off the default path,
+            # then builds the sync source from the preset's OWN repos. Pass env through.
+            init(root, preset, source=source, runner=runner, env=env)
             return 0
 
         cfg = Config.load(root / TOML_NAME)
